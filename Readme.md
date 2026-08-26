@@ -51,3 +51,50 @@
 ### 下一步计划
 - 待用户确认后执行部署（`./env/deploy-local.sh` 重建前端 dist 并同步到 Backend/static + 重启后端 uvicorn 8081）
 - 继续收集用户对新对话体验与分子预览 UI 的反馈
+
+## 汇报日期 2026-08-21
+
+### 工作内容
+
+#### 一、全面修复 ligand-binder 与 AME 的原生 TTO 链路
+- 梳理 Proteina-Complexa 的 ligand-binder、AME 生成、beam search、checkpoint rollout、reward 聚合和最终候选提升链路，明确 **Proteina-Complexa 是唯一生成 backbone，RF3 仅作为 rollout reward evaluator**，不将外部 RFD3/BindCraft 接入 TTO backbone
+- 核查本机 RF3 运行环境，确认项目 `.venv` 不包含可用 RF3，但服务器共享环境 `/home/sl/miniforge3/envs/rosettac` 已提供 `rf3` / `rfd3`、`rc-foundry 0.1.12` 和可用 CUDA；项目 checkpoint 可通过 `community_models/ckpts/RF3/rf3_foundry_01_24_latest_remapped.ckpt` 正确访问
+- 更新 `.env`，将失效的项目内 RF3 路径切换为共享 RF3；在 `Backend/main.py` 增加 sibling executable 自动发现、路径解析和 ligand/AME TTO 启动前的 executable/checkpoint 严格预检
+
+#### 二、RF3 reward 可靠性与无损工程优化
+- 重构 `src/proteinfoundation/rewards/rf3_reward.py`：初始化时验证 executable/checkpoint；候选推理失败、缺少 CIF/summary、AME 缺少 PAE/ipSAE 时直接 fail-fast，不再生成默认 prediction 或伪造 reward
+- 新增 `score_batch()`：同一 checkpoint 下的多个候选通过一次 `rf3 fold inputs=[...]` 批量评估，复用进程启动和 checkpoint 加载，减少重复开销
+- 更新 `base_reward.py` 和 `reward_utils.py`：支持 CompositeRewardModel 严格批量聚合，验证返回数量及每个 `total_reward` 为有限标量；禁止 folding child 失败后吞异常并继续使用 `total_reward=0`
+- 全程保持 RF3 默认推理精度，没有注入 `n_recycles`、`diffusion_batch_size`、`num_steps`、seed 或 early-stopping 等预算覆盖，工程优化不以牺牲准确度为代价
+
+#### 三、真实 GPU 端到端验证与 AME 输出修复
+- 在 RTX 5090 上完成 ligand-binder 最小真实 TTO：加载 Proteina ligand checkpoint/LoRA，执行 100-step beam search 和 RF3 rollout 评分，生成 PDB、binder PDB、reward CSV、`designs.csv` 和运行进度
+- ligand 真实 RF3 指标包括 `min_ipAE=0.13419354`、`plddt=0.7386`、`ranking_score=0.5875`；该最小样本 final 恰为最优，因此增益为 0，但候选评分与选择诊断完整生效
+- 完成 AME `M0050_1dbt` 真实 GPU TTO；首轮发现 AME 同时包含 motif 与 ligand 条件时，`generate.py` 在复制 motif 信息后提前 `return`，导致遗漏标准 `designs.csv`
+- 删除错误提前返回后重新执行 AME v2：成功生成完整结构和诊断；RF3 指标 `min_ipAE=0.34451613`、`has_clash=0`、`max_ipSAE=0`、`plddt=0.6664`、`pTM=0.26478815`，按原始配置得到 `total_reward=-0.1847573`
+- AME TTO 最终选择 lookahead 而非 final，`tto_gain_vs_best_final=0.00408053`，以真实端到端结果确认 TTO 对配置定义的质量 reward 产生正向提升
+
+#### 四、回归验证与环境清理
+- 执行 `.venv/bin/python -m pytest -q tests/search tests/generate Backend/test_tto_launch_args.py`，结果 **12 passed**
+- 对 `Backend/main.py`、`generate.py` 及三个 reward 模块执行 `py_compile`，并完成 `git diff --check`，全部通过
+- 清理中止安装遗留的 `.rf3-venv`（`rc-foundry 0.2.0`，约 7.0 GB）、配套 `.uv-cache`（约 5.4 GB）、runtime probe 临时目录以及修复前的首轮 AME smoke 结果，合计释放约 **12.4 GB**
+- 保留 ligand 与 AME v2 最新成功验证产物；复核共享 RF3、项目 checkpoint、两套 `designs.csv` 和 rewards CSV 均完整可用
+
+### 结果与产出
+- ligand-binder 和 AME 的原生 Proteina-Complexa TTO 已可在当前机器上真实运行，不再受项目内缺失 RF3 环境阻塞
+- RF3 从可能产生默认/伪 reward 的宽松路径升级为严格 fail-fast，并通过批量候选评分消除重复启动和模型加载，同时保持默认精度预算
+- AME 输出索引缺失问题已修复，后续 evaluate 和结果枚举可以通过标准 `designs.csv` 获取最终设计
+- 获得两条真实 GPU 端到端证据，其中 AME 在该样本上取得 `+0.00408053` 的 reward 提升
+- 相关回归测试、语法检查、diff 检查全部通过，并释放约 12.4 GB 无用环境与缓存
+
+### 遇到的问题及解决
+- **项目 `.venv` 无 RF3，直接运行 ligand/AME TTO 会失败**：没有继续重复下载模型，而是排查服务器已有环境，复用共享 rosettac Foundry，并在 Backend 增加自动发现和严格预检
+- **曾考虑通过较低 RF3 推理预算缩短验证时间，但会影响准确度且未经确认**：撤回所有预算覆盖，只保留不改变预测协议的批处理和进程复用优化；当前生产链路完全使用 RF3 默认推理参数
+- **RF3 失败可能被默认 prediction 或零 reward 掩盖**：改为对 executable、checkpoint、每个候选输出和 AME 特有指标逐层校验，任一缺失立即失败并暴露真实错误
+- **AME 成功生成结构但缺失 `designs.csv`**：定位到 motif 分支提前返回，进行最小修复后重新完成 GPU smoke，确认标准索引和诊断均恢复
+- **中止的独立 Foundry 安装占用大量空间**：确认正式链路使用共享环境且无进程占用后，安全删除隔离环境与安装缓存
+
+### 下一步计划
+- 在更多 ligand 和 AME 任务上扩大 TTO 样本规模，统计 reward 增益分布、选中 lookahead 的比例及 GPU 时间开销
+- 持续监控 RF3 batch 在长序列、多配体和高并发场景下的显存峰值与失败诊断，必要时只优化任务编排，不降低预测精度
+- 在 SC/MMseqs/DSSP 运行环境完成配置后，再按既有评估协议补充 bioinformatics 指标验证，不擅自改变当前 ligand/AME reward 定义
