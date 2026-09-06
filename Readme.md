@@ -98,3 +98,44 @@
 - 在更多 ligand 和 AME 任务上扩大 TTO 样本规模，统计 reward 增益分布、选中 lookahead 的比例及 GPU 时间开销
 - 持续监控 RF3 batch 在长序列、多配体和高并发场景下的显存峰值与失败诊断，必要时只优化任务编排，不降低预测精度
 - 在 SC/MMseqs/DSSP 运行环境完成配置后，再按既有评估协议补充 bioinformatics 指标验证，不擅自改变当前 ligand/AME reward 定义
+
+## 汇报日期 2026-09-06
+
+### 工作内容
+
+#### 一、TTO 启动协议与最终评估对齐（Backend）
+- `Backend/main.py` 新增 `build_tto_generation_args()`：protein_binder 的 TTO 奖励模型与最终独立 AF2-Multimer 评估严格同构 —— `model_nums=[0]`（AF2-Multimer model 0）、`num_recycles=3`、`use_initial_guess=true`、`use_binder_template=false`；reward 权重取 `i_pae=-1.0` 作为主目标、`plddt=-0.25` 作为弱次目标（负权重把 ColabDesign 的"损失"翻转为"奖励"，4:1 保证 iPAE 主导），并排除未归一化的结构对齐 MSE 项
+- ligand_binder / ame_scaffold：将 `rf3folding` 的 `plddt`/`pTM` 权重置 0，TTO 选择由 min_ipAE（加 AME 既有 clash/ipSAE 项）决定，避免全局置信度项淹没界面目标
+- Beam Search 保留策略固化进启动参数：`keep_lookahead_samples`、`track_best_rollout`、`low_temperature_rollout`（rollout 结构噪声 0.1）、100 步 checkpoint 与最终 beam 统一比优选优，保证 TTO 保留的是"完全去噪"后的最优 rollout
+- `AF2RewardModel`（`src/proteinfoundation/rewards/alphafold2_reward.py`）新增独立 `use_binder_template` 参数：`None` 时保持旧行为（由 `use_initial_atom_pos/use_initial_guess` 推导），解耦后 TTO 可在保留 initial guess 的同时显式关闭 binder 模板，与评估打分协议一致；旧配置不受影响
+- `Backend/test_tto_launch_args.py` 对上述启动参数逐项断言，测试 **2 passed**
+
+#### 二、pLDDT 置信度分数全平台统一到 0–100
+- 系统审计字段 / CSV / API / UI / 阈值五层：API 侧 `_plddt_100` / `_normalize_plddt_fields` / `_normalize_quality_thresholds`（main.py:3625-3656）对 design 行与阈值做幂等归一并兼容历史 0–1 数据；奖励模型（AF2 / RF3 / ESMFold2）暴露的 pLDDT 均为 0–100，loss 项改名 `plddt_loss` 隔离；CSV 生产端（colabdesign / esmfold2 / rf3 / multimer / monomer eval）与 success criteria（90/80 阈值 + `normalize_plddt_score`）、`thresholds.yaml`（plddt_min: 85）均已达标
+- 发现并修复 2 处 UI 遗漏：`Interface/src/lib/validationMetrics.js` 中 `self_plddt` 阈值 `0.9→90`、`monomer_esmfold_plddt` 阈值 `0.7→70` —— 原 0–1 刻度在 0–100 数据下会使校验卡恒判失败
+- 重新执行 vite build 并同步 `Backend/static`（新 bundle `index-BwCYtmYb.js`），已验证产物包含修正后的阈值
+
+#### 三、Agent Memory 界面与功能添加
+- 新增 `Backend/user_memory.py`：用户级持久化项目记忆的确定性存储边界 —— SQLite（WAL、busy_timeout=30s），按 `owner_email` 严格隔离；实验完成时由 Memory Update Agent 全量重写记录，手动编辑复用同一版本化 replace 通道；记忆检索留给 API 层（需要 LLM client），存储层保持无 LLM 依赖
+- 新增前端记忆页 `Interface/src/pages/UserMemory.jsx`，接入 `App.jsx` 路由与 `TopNav` 入口；`LanguageContext.jsx` 补齐中英文案
+- `AgentChat.jsx`、`DesignWizard.jsx`、`launchRequest.js` 同步集成记忆相关交互；`ProteinHarness/executors/task_info.py` 与 design agent 的 WIKI/profile 更新，使 agent 侧可获取任务与记忆上下文
+
+#### 四、Memory Agent 的分析 skill
+- 新增 `Backend/memory_analysis.py`（约 658 行，纯 Python 标准库、零第三方依赖）：把用户隔离的终态（completed/failed）实验元数据压缩为小规模、可审计的 evidence brief —— 重复配置对比（≥2 次才升格为结论）、成功/失败对照、质量代理指标归纳（pLDDT/iPTM/iPAE/scRMSD/DockQ/F_nat 等，全部显式标注为 in-silico proxy，不推断真实亲和力）、结构多样性、接触证据与复发失败模式；输出作为 LLM Memory Writer 的输入而非最终结论
+- 新增 `Backend/memory_analysis_skill.md`：记忆更新 skill 的写作契约 —— 只保留会改变未来设计决策的结论及其关键限制，禁止原始指标表/任务 ID/来源附录，固定四段输出（项目目标与持久约束 / 可复用设计结论 / 开放问题与防护 / 下一步实验优先级），每次更新 reconcile 替换被取代的结论而非追加流水账
+
+### 结果与产出
+- TTO 搜索期打分协议与最终独立评估完全同构（同模型、同 recycle、同模板策略），启动参数由测试锁定，杜绝 UI/API 路径漂移
+- pLDDT 0–100 契约在字段、CSV、API、UI、阈值五层闭环，历史 0–1 数据无缝兼容
+- 平台具备完整的用户级项目记忆链路：存储层（user_memory.py）→ 前端页面（UserMemory.jsx）→ agent 集成 → "实验数据 → 可复用结论"的确定性分析 skill（memory_analysis.py + memory_analysis_skill.md）
+
+### 遇到的问题及解决
+- **UI 校验阈值沿用 0–1 旧刻度**：`validationMetrics.js` 两处 pLDDT 阈值在 0–100 数据下恒失败；统一改为 90/70 并重建前端 bundle 后验证产物生效
+- **TTO 与评估打分协议不一致**：`use_binder_template` 原本与 initial guess 隐式耦合（开 initial guess 就连带把 binder 坐标当模板），而评估协议是"initial guess 开、binder 模板关"；新增独立参数解耦，`None` 保留旧行为向后兼容
+- **负 reward 数值易被误解为异常**：明确其为损失加权后的设计取向 —— total_reward 仅用于候选间排序，负值正常
+- **`tests/search/test_success_criteria.py` 在当前 conda 环境缺 hydra 无法收集**：确认为环境问题（项目 `.venv` 可运行），与本轮改动无关；本轮相关测试 `Backend/test_tto_launch_args.py` 全部通过
+
+### 下一步计划
+- 扩大 protein_binder / ligand / AME 的 TTO 真实样本规模，统计 reward 增益分布与 GPU 时间开销
+- 以真实多用户数据验证 memory 分析 skill 的输出质量与版本化替换行为，打磨 UserMemory 页面交互细节
+- 在 SC/MMseqs/DSSP 环境就绪后补充 bioinformatics 指标验证，不改变现行 reward 定义
