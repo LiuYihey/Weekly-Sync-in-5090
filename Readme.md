@@ -170,3 +170,43 @@
 ### 下一步计划
 - 观察真实使用中 sidebar 钉底窗口（850ms）与慢网络 rehydrate 的匹配情况，必要时按需延长
 - 检查 BioAgentChat / HtsAgentChat 是否存在同类初始锚定跳变，评估是否复用 `pinChatToBottom` 方案
+
+## 汇报日期 2026-09-09（续）：用户记忆系统增量重构与平台品牌升级
+
+### 工作内容
+
+#### 一、CD8 记忆丢失的根因定位与找回
+- **根因**：原 `user_memory.py` 采用"每用户单行、整篇覆盖"的存储（owner_email 主键，version 仅计数不留副本），每次任务终态 LLM 重写全文档，跨项目（CD8 vs PDL-1）共用一篇导致后续任务把无关内容逐步裁掉——典型的整篇重写式灾难性遗忘
+- **找回**：SQLite 覆盖写入后旧页内容仍残留空闲页，用 `strings` 从 `user_memory.db` slack space 提取 CD8 时代文档残片，所有决策级结论完整恢复并与 PDL-1 记忆合并写回
+
+#### 二、记忆系统增量架构改造（`Backend/user_memory.py`、`Backend/main.py`、`Backend/memory_analysis.py`、`Backend/memory_analysis_skill.md`）
+- **项目分治存储**：主键改为 (owner_email, project_key)，每个 target 独立记忆行，结构性杜绝跨项目遗忘
+- **版本历史表**：新增 `user_memory_history` 表 + `history()`/`restore()` API，逐版本归档、可回滚，坏更新不再不可逆
+- **LLM 补丁协议替代整篇重写**：更新 agent 通过 `list_items`（轻量索引）→ `read_item` → `read_bullets` 工具循环（≤6 轮）浏览记忆，输出 `{create_item / append_bullets / update_bullet / remove_bullet / rewrite_item}` JSON patch
+- **确定性合并器**：只有 patch 命中的 bullet 被改写，未触及条目逐字节保留；超长 bullet、未知 id 等非法 op 直接拒绝（LLM 不再有机会"顺手"删别的条目）
+- **noop 机制**：无材料变化时记忆一字不动、不 bump 版本；`memory_processed_at` 标记防任务 resume 重复触发
+- **检索侧两阶段注入**：新会话开启 memory 时先给 LLM 轻量 item 索引识别相关 item，再选择性读取细粒度 bullets，以 reference experiences 上下文注入 design agent，全程不加载全量记忆（防上下文爆炸）
+- **记忆格式去固定维度**：自由 bullets、无固定 section/条数，证据没触到的维度不硬凑；存量数据迁移剥除 `[tag]` 前缀
+- **废话治理**：写作规则改为"单 bullet 单结论、最多 1-3 个关键数字、普适话术=filler 禁入、中文优先"；确定性简报同步中文化并删硬编码说教
+- **可控参数关联分析（核心新增）**：从任务 request 字段提取 agent 可控超参数（binder 长度区间、结合位点/热点、fold-guidance、TTO、designability、样本量），与结合质量做关联——连续轴 Pearson（r≥0.45、n≥8）+ 组间 arm 对比（每 arm≥3 runs、差距≥15%），并设模型级信号门槛（median DockQ≥0.15，防失败配置产生噪声关联）
+- **首条轴经验产出**：BindCraft 结合质量与 α-螺旋占比正相关（r=0.63，n=38）——以真增量 patch（append + update 两条 op）入库，PDL-1 条目逐字节未动，同时验证了合并器隔离性
+
+#### 三、平台品牌升级为 ProteinCraft Agents
+- 新建 `Interface/src/components/Wordmark.jsx` 统一品牌组件：ProteinCraft 几何无衬线（紧字距）+ Agents 衬线斜体配品牌绿→青渐变，暗色版带缓慢渐变流动动效；纯系统字体栈、零 CDN 依赖（国内离线部署安全）
+- `<title>`、中英文案（"How ProteinCraft Agents works"）同步更新；构建部署至 `Backend/static` 并清理旧 bundle
+
+### 结果与产出
+- 记忆版本链 v6→v12 全部归档可回滚；存储层 8 项单元测试全过
+- CD8 全部决策级结论找回，且此后由三层防护（项目隔离 / patch 隔离 / 版本兜底）结构性免疫遗忘
+- 记忆内容从"固定维度硬凑"转为"决策导向"：v12 仅保留能改变下一次迭代决策的条目（骨架排名、失败模式、位点假设、轴经验、判别性实验）
+- 品牌视觉全站统一上线（TopNav 15px / Landing 导航 19px / footer 17px 暗色动效版）
+
+### 遇到的问题及解决
+- **编辑工具多次"假成功"导致前端运行时崩溃**（`Wordmark is not defined`，import 未落盘但工具报成功）：改为脚本写入 + grep 验证落盘后再构建；后端 `memory_analysis.py` 曾出现同类回滚，同法根治
+- **效应量门槛误杀强关联**：α-螺旋关联 r=0.63 但中位差仅 13%，被 15% 门槛滤掉——分析后确认模型级噪声门槛已足够，移除中位差门槛
+- 后端重启需 sudo 权限未执行：agent 侧新行为（工具循环、中文简报、可控参数关联）待 `sudo bash env/restart-bindagent.sh` 后生效
+
+### 下一步计划
+- 重启 bindagent 后跑一次 PDL-1 小实验，观察 memory agent 的工具循环与 patch 日志是否符合设计
+- 5niu cohort 每骨架仅 1 次 run，需按匹配采样量构造对照 arm 才能沉淀轴经验
+- 评估统一 PDL-1 被两个 target identity 拆分导致的统计碎片化问题
