@@ -139,3 +139,34 @@
 - 扩大 protein_binder / ligand / AME 的 TTO 真实样本规模，统计 reward 增益分布与 GPU 时间开销
 - 以真实多用户数据验证 memory 分析 skill 的输出质量与版本化替换行为，打磨 UserMemory 页面交互细节
 - 在 SC/MMseqs/DSSP 环境就绪后补充 bioinformatics 指标验证，不改变现行 reward 定义
+
+## 汇报日期 2026-09-09
+
+### 工作内容
+
+#### 一、修复 launch 跳转后 sidebar 会话滚动位置来回跳变的问题
+- **现象定位**：在 agent 对话中点击实验 launch card 跳转到实验页面时，对话转为右侧 sidebar 的瞬间，内容先显示对话开头、再跳回当前阅读位置，期间两者来回跳变
+- **根因分析**（`Interface/src/components/AgentChat.jsx`）：
+  - sidebar 为全新挂载实例，localStorage 水合的消息先以 `scrollTop 0` 首绘（闪到对话开头）
+  - 原 `useEffect` 中 80ms 延迟的恢复逻辑再跳回记忆偏移（当前阅读位置），产生可见跳动
+  - 挂载引导的 rehydrate 完成时 `queueScrollPreserve()` 若在 80ms 窗口内执行，会把尚未锚定的 `scrollTop 0` 误当作"要保留的位置"写回，与恢复定时器互相拉扯，形成来回跳变
+- **修复方案**：
+  - `Interface/src/lib/chatScroll.js` 新增 `pinChatToBottom()`：每 tick 重新计算 `scrollHeight` 并钉底，覆盖合并消息/卡片水合导致内容持续增长的窗口期
+  - 初始视口锚定由 `useEffect` 改为 `useLayoutEffect`，在浏览器绘制前同步执行，对话开头永远不会被闪现
+  - `variant === "sidebar"` 挂载（launch 跳转 / 任务详情绑定）直接钉底约 850ms 展示最新消息，不再恢复"当前位置"（产品语义：sidebar 应精准看到最新消息）；inline（wizard 主界面）保持原有"恢复记忆偏移"行为不变
+  - `queueScrollPreserve()` 增加守卫：初始锚定未完成时不把 0 误存为保留位置；sidebar 钉底窗口期内不与 pin 抢滚动条
+  - 自动滚动 effect 调整为仅在初始锚定完成后对新消息生效，并同步 `prevMsgCount` 基线
+
+### 结果与产出
+- 点击 launch 后 sidebar 直接静止显示对话底部最新消息：无顶部闪烁、无来回跳变
+- 钉底窗口结束后行为正常恢复：后台刷新时用户向上滚动阅读的位置仍会被保留，不影响长会话阅读
+- wizard 主界面 chat 的滚动记忆行为完全不受影响（最小改动范围，仅 sidebar 分支变化）
+- 单元测试 `npm run test:unit` 32/32 全部通过，`npm run build` 构建成功
+
+### 遇到的问题及解决
+- **跳变涉及三个异步源互相竞争**（首绘 0 偏移、80ms 延迟恢复、rehydrate preserve 竞态）：没有逐个打补丁，而是把"初始锚定"收敛为绘制前同步执行的单一决策点，并让 preserve 机制在锚定完成前完全退让，从时序上根除竞争
+- **rehydrate 合并消息会撑高列表导致钉底失效**：固定偏移的 `restoreChatScrollTop` 无法处理内容增长，新增每 tick 重算 `scrollHeight` 的 `pinChatToBottom` 解决
+
+### 下一步计划
+- 观察真实使用中 sidebar 钉底窗口（850ms）与慢网络 rehydrate 的匹配情况，必要时按需延长
+- 检查 BioAgentChat / HtsAgentChat 是否存在同类初始锚定跳变，评估是否复用 `pinChatToBottom` 方案
