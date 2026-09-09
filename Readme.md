@@ -210,3 +210,34 @@
 - 重启 bindagent 后跑一次 PDL-1 小实验，观察 memory agent 的工具循环与 patch 日志是否符合设计
 - 5niu cohort 每骨架仅 1 次 run，需按匹配采样量构造对照 arm 才能沉淀轴经验
 - 评估统一 PDL-1 被两个 target identity 拆分导致的统计碎片化问题
+
+## 汇报日期 2026-09-09（续）：TTO protein_binder 实验崩溃修复与 Landing 视频更新
+
+### 工作内容
+
+#### 一、TTO protein_binder 实验失败分析（exit code 1）
+- 分析失败实验 `protein_binder_custom_9a20be7c_rcsb_5NIU_proteina_e3caf218` 的完整日志（`logs/generate_..._e3caf218_*.log`）：beam search 第一步 batch-scoring 16 个 checkpoint 候选时崩溃；对照组（未开启 TTO）不走 AF2 reward 评分路径，因此不受影响
+- 定位出两个叠加 bug：
+  - **主因**：Hydra 命令行注入的 `model_nums=[0]` 以 OmegaConf `ListConfig` 形式传入 `AF2RewardModel`，colabdesign `design.py` 的 `isinstance(models, list)` 判断不识别 ListConfig，将其包装成嵌套列表 `[[0]]`，随后 `ns_name.index()` 抛 `ValueError: [0] is not in list`
+  - **次因（掩盖主因并放大为整 job 崩溃）**：异常清理路径调用 JAX v0.4.36 已移除的 `jax.clear_backends()`，抛 `AttributeError` 替换原始异常，导致 generate job 直接 exit 1
+
+#### 二、代码修复（`src/proteinfoundation/rewards/alphafold2_reward.py`）
+- `__init__` 中将 `model_nums` 归一化为纯 Python int 列表 `[int(n) for n in model_nums]`，消除 ListConfig 与 colabdesign 的类型不兼容；带注释说明 Hydra 注入背景
+- `_cleanup_jax_state` 重构为版本兼容的 best-effort 清理：`clear_caches` 保留，`clear_backends` 通过 `getattr` 仅在存在时调用且失败只告警——任何情况下不再吞掉/替换原始异常
+
+#### 三、Landing page Design Agent 演示视频替换核查
+- 用户替换了 `Interface/public/videos/design-agent-demo.mp4`；核查全链路确认源码零改动需求：`LandingPage.jsx` 引用同名路径、`LanguageContext.jsx` 中英文案通用不绑定旧视频内容、`LandingVideoPlayer.jsx` 采用 `16/9` + `objectFit: contain` 对任意分辨率自适应且无 poster 依赖
+- 发现部署断层：nginx 实际服务的 `Backend/static/videos/` 仍只有旧 `DesignAgent.mp4`，新文件未进 dist/static，线上该视频实为 404；给出「只改前端」部署命令（build → rsync --delete → reload nginx），顺带由 `--delete` 清理不再被引用的旧文件
+
+### 结果与产出
+- TTO 崩溃两个 bug 修复完成：旧路径用 ListConfig 精确复现日志错误，修复后归一化验证通过；新清理函数在 JAX 0.4.38（无 `clear_backends`）下执行正常
+- `Backend/test_tto_launch_args.py` 回归 **2 passed**，实验可直接原参数重新发起
+- Landing 视频链路核查结论明确：无需改代码，仅需执行前端部署命令即可上线新视频
+
+### 遇到的问题及解决
+- ** Hydra ListConfig 类型陷阱**：命令行传参的列表经 Hydra 注入后是 ListConfig 而非 list，`isinstance` 检查全部失效——在入口处统一归一化为原生类型根治
+- **异常清理掩盖真实错误**：cleanup 抛出的 AttributeError 覆盖了原始 ValueError，日志初看误导排查方向；清理逻辑改为不抛异常后，未来故障将直接暴露真实根因
+
+### 下一步计划
+- 重新发起 5NIU protein_binder TTO 实验，验证 beam search + AF2 评分全链路跑通并观察 reward 轨迹
+- 视部署执行情况，确认线上 design-agent-demo.mp4 可播放且旧 DesignAgent.mp4 已被清理
