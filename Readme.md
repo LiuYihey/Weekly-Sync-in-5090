@@ -241,3 +241,61 @@
 ### 下一步计划
 - 重新发起 5NIU protein_binder TTO 实验，验证 beam search + AF2 评分全链路跑通并观察 reward 轨迹
 - 视部署执行情况，确认线上 design-agent-demo.mp4 可播放且旧 DesignAgent.mp4 已被清理
+
+## 汇报日期 2026-10-09
+
+### 工作内容
+- **补齐 PXDesign 真实测试**：此前仅 wrapper 单元测试，本次以 PD-L1 为靶点完成生成→归一化→评估端到端测试
+- **Genie3 内部 TM 过滤与平台职能协调**：参考 BindCraft 的做法，将结果适配层（`src/proteinfoundation/model_wrappers/result_adapter.py`）改为平台侧软过滤——尽量取全样本全原子 refold 结构池，由平台按 i_pTM 统一排序择优，不再让模型内部 TM 卡死候选
+- **各模型参数 agent 可配置**：9 个 per-model 调参旋钮（如 `genie3_direction_scale`、`boltzgen_num_designs`、`pxdesign_preset`、`bindcraft_max_trajectories`）暴露为 `backbone_params` 配置字段，每项含质量/速度影响说明，打通 schema → 后端 → wrapper 环境变量 → 前端全链路
+- **PD-L1 全骨架基准**：靶点 PDL1_5o45_A116（A1-116，热点 A40/A99/A107），6 个生成骨架（Proteina-Complexa / BindCraft / RFDiffusion3 / PXDesign / Genie 3 / BoltzGen）各 n=4 串行生成并统一评估
+- **序列重设计对比实验**：同批骨架分别用模型自带序列 vs soluble_mpnn 重设计序列评估（`sequence_types=[self,mpnn]`），检验"先骨架、再换序列模型"能否提升质量
+- 绘制两张对比图：骨架性能箱线图 + 自带序列 vs 重设计柱状图
+
+### 结果与产出
+- 六骨架基准（自带序列 i_pTM 均值 / mpnn 重设计 i_pTM 均值）：
+
+| 骨架 | 自带序列 | mpnn 重设计 |
+|---|---|---|
+| BindCraft | **0.883** | 0.832 |
+| PXDesign | 0.667 | 0.598 |
+| Proteina-Complexa | 0.586 | 0.456 |
+| Genie 3 | 0.532 | **0.748** |
+| RFDiffusion3 | 0.511 | 0.712 |
+| BoltzGen | 0.478 | 0.710 |
+
+- **结论（分层明确）**：自带序列的共设计模型（BindCraft/PXDesign/Proteina-Complexa）换序列反而降质，应保留自带序列；纯骨架模型（Genie 3/BoltzGen/RFDiffusion3）经 soluble_mpnn 重设计提升约 **+0.2**，且全部越过 0.5 结合阈值——"先骨架、再换序列模型"对纯骨架类确能显著提高质量
+- 回归测试全绿：wrappers 19 项 / ProteinHarness 215+ 项 / launch_config 17 项
+
+### 遇到的问题及解决
+- **Genie3 UNK 序列污染**：默认 generate 阶段产出 CA 骨架缺序列 → 固定 `GENIE3_STAGE=run`（含逆折叠+refold）并加 `_pdb_binder_has_sequence` 挡板；另发现 `direction_scale=1.0` 使成功率归零，定档 0.0
+- **BoltzGen 生成失败**：CCD 分子库仅 HF 有 → `BOLTZGEN_MOLDIR` 指向本地 boltz2 权重目录
+- **评估 GPU OOM**：多 ESMFold2 并行争抢 → 增加 `EVAL_GPU` 环境变量控制评估卡并串行化
+- **基准汇总表覆盖写**：慢批次会冲掉快批次结果 → 汇总 CSV 改为合并写
+
+### 下一步计划
+- 将"纯骨架模型 + soluble_mpnn 重设计"作为平台默认序列策略候选纳入阈值/流程配置
+- 视需要扩大 n 值复核 BoltzGen 过采样与 top hit 表现
+
+## 汇报日期 2026-10-10
+
+### 工作内容
+- **代码仓库宏观重构（以平台为核心）**：仓库根目录改名 `Proteina-Complexa → ProteinCraft-Agents`，修复全部内外部引用（`.env`、systemd/nginx 配置模板、editable 安装 pth、venv shebang、AF2 参数软链改相对化、外部基准脚本）
+- **消除"外部模型"表述**：目录改名 `external_backbones/ → model_wrappers/`、`external/ → model_workspace/`，同步全部代码标识符、命令模板、注释与文档；历史磁盘格式（`.raw_external`、`inference/external_*`）保留兼容
+- **文档逐份更新**：README 平台视角重写（7 个骨架模型全列、修正过时工具名/服务名/目录表）、docs 逐篇修订、显示名规则落地（Proteina-Complexa 仅指模型，平台自称 ProteinCraft Agents）、历史设计文档加头注
+- **新建 Codebase Wiki**：根目录 `wiki/` 共 9 页（架构总览、目录地图、模型清单、数据流、术语表、外部引用登记、测试指南、协作指南），仿 Codebase Wikipedia 组织；原零散笔记 Zui_Core_md_paper 内容吸收进 wiki 后归档至 `docs/archive/zui_core_notes/`
+- **全链路验证**：三套测试、前端构建+单测、后端 API、CLI 生成+评估、两个模型 wrapper 冒烟、nginx 服务
+
+### 结果与产出
+- 6 个 commit 完成分阶段重构；回归与重构前基线**完全一致**（tests 43+2 / ProteinHarness 216 / Backend 172+2，仅 4 个已知预存失败豁免，零新增失败）
+- 全链路冒烟全部通过：`complexa generate`（27s）→ `complexa evaluate`（self+mpnn，240s）、BindCraft/Genie 3 wrapper 生成+归一化、`/api/health` 与 `/api/agent/manifest` 200、前端 build+unit 全绿、nginx UI/API 200
+- 外部引用全部登记在 `wiki/external-references.md`（模型运行环境、工具、权重、外部脚本、部署单元、网络服务），后续仓库迁移可按表逐项核对
+- 代码协作边界成文：`wiki/contributing.md` 给出分层扩展点（新模型/新工具/新场景各改哪里）、文档二分规则（Agent 运行时提示 vs 人读文档）、提交前检查清单
+
+### 遇到的问题及解决
+- **依赖降级陷阱**：`uv pip install -e .` 按 pyproject 松约束重解析依赖，把 biotite 降到 0.41.2 导致 atomworks 导入失败（3 个测试收集报错）→ 回装规范版本 `biotite==1.4.0` 并将教训写入 wiki/testing.md
+- **线上 nginx 配置需 root**：`/etc/nginx/sites-*` 仍指旧路径且无 sudo 权限 → 建临时兼容软链恢复服务（UI/API 验证 200），留一条 sudo 命令待执行后移除软链
+
+### 下一步计划
+- 执行 sudo 命令更新线上 nginx 配置并删除临时软链，完成部署侧彻底切换
+- IDE 工作区重开到新路径 `ProteinCraft-Agents`
