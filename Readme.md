@@ -299,3 +299,49 @@
 ### 下一步计划
 - 执行 sudo 命令更新线上 nginx 配置并删除临时软链，完成部署侧彻底切换
 - IDE 工作区重开到新路径 `ProteinCraft-Agents`
+
+## 汇报日期 2026-10-11：过时开发产物清理 + 顶层目录树状重构（零业务影响）
+
+### 工作内容
+
+#### 一、过时开发产物清理（commit `258cb5c`）
+- **清理平台自身开发遗留物**（严格不动平台用户产物）：删除 patch 残留 `Backend/auth/routes.py.orig/.patch`、`Interface/src/pages/account/UserAccount.jsx.orig/.patch`，清出根目录游离的 `Backend/auth.db`、`users.db`
+- **归档已完成的 plan/progress 文档**：`.trae/documents/` 下已完成的宏观重构计划、`docs/plan&progress/*`（PROMPT、Agent_Build_plan/progress、fail_fast_rules、old_plan/old_progress）统一移入 `docs/archive/plans/`，`docs/ui_improvement_plan.md` 移入 `docs/archive/`
+- **建立管理员分析产物规范**：根 `Output/` 下散落的 CD8 分析包、platform_report、scene_A/B/C 实验脚本与配置统一移入新建的顶层 `Admin_Analysis/`；在 `wiki/contributing.md` 写明"产出实验结果分析/研究产物 → `Admin_Analysis/`"的扩展点约定，并标注两个例外（`Output/analysis/` 是脚本硬依赖必须留原位、`Output/api_runs/` 是用户任务产物）
+- `logs/` 按用户决策保留最近 30 天；`.cursor/` 按用户决策保留
+- 变更规模：33 files changed, 12 insertions(+), 279 deletions(-)
+
+#### 二、顶层目录树状重构（commit `ed6cc56`，458 files changed, 709 insertions(+), 536 deletions(-)）
+先做全仓路径依赖测绘，识别出两个路径锚点（`Backend/main.py` 的 `PROJECT_ROOT`、`ProteinHarness/registry.py` 的 `HARNESS_ROOT`）与一条**最强隐式契约：cwd = 项目根**（Hydra override、subprocess 命令中的 `./assets/...`、`./model_workspace/...`、`./inference/...` 全部以此为基准）。在此测绘基础上按 8 个阶段执行：
+- **阶段 1 目录移动（全部 `git mv`，保留 rename 历史）**：
+  - 新建 `tools/` 层——`portable_pubmed_retrieval → tools/pubmed_retrieval`（外部 vendor 目录正式内化进平台）、`script_utils → tools/script_utils`、根 `scripts/ → tools/scripts/`
+  - 新建 `third_party/` 层——`community_models → third_party/community_models`（含 openfold / colabdesign / ProteinMPNN / LigandMPNN / ckpts）
+  - 新建 `deploy/` 层——`env/ → deploy/`（14 个部署脚本 + `deploy/docker/`）
+  - 新建 `runtime/` 层——全部运行数据归入 `runtime/{Output,inference,logs,outputs,rf3_outputs,model_workspace,user_workspace,assets,Input,evaluation_results,store}`；根目录从 30+ 平铺目录收敛为 18 个语义目录
+- **阶段 2–3 代码与配置面全量同步**：`Backend/main.py`（12676 行，路径最重）、`src/proteinfoundation/*`（含 `command_runner.py`、`rf3_reward.py`、`cli_runner.py`、`result_analysis/analysis.py` 等）、`configs/` 下 19 个 yaml、`.env`/`.env_example`、`Makefile`、`.gitattributes`（LFS 规则）、`Interface/src/components/AgentChat.jsx`、`Admin_Analysis/` 脚本
+- **阶段 4 历史路径兼容层（本次重构的关键设计）**：新建 `Backend/legacy_paths.py` 的 `normalize_legacy_path()`，同时处理 ①旧仓库根绝对路径（`/home/lyh/Liuyihey/Proteina-Complexa/...`）②旧相对串（`./inference/...`、`Output/api_runs/...`）③新增/变更路径原样透传；在 7 类消费点接入——`/api/download`、`/api/pdb`、`download_zip`、`_add_reward_path`、`_list_final_structure_paths`、DockQ/Rosetta 读取、`_prefer_visualization_structure_path`/`_relative_project_path`、`_load_task_meta` 出口
+- **阶段 5 重装可编辑包**：`uv pip install -e .` 后修复 `.venv/.../_editable_impl_proteinfoundation.pth` 的 7 条路径映射；`pyproject.toml` 的 hatch `packages` + `sources` 映射显式列出 4 个 community_models 子包与 `ProteinHarness`
+- **阶段 6 文档同步**：`wiki/directory-map.md` 按新树整篇重写（拆为平台核心 / 工具与第三方 / 部署与环境 / runtime 数据层 / 文档与分析 五张表）、`wiki/contributing.md`、`wiki/testing.md`、`README.md` 架构图
+- **阶段 7–8 验证与提交**：测试全绿、后端重启、历史路径下载回归验证通过
+- 全程留有回滚备份 `/home/lyh/backup_proteincraft_restructure_20261011.tar.gz`
+
+### 结果与产出
+- **零业务影响已验证**：tests 45 项 + Backend/ProteinHarness 282 项全部通过（仅剩 wiki/testing.md 豁免清单中 2 项文档断言）；`import openfold / colabdesign / ProteinMPNN / LigandMPNN / proteinfoundation / ProteinHarness / Backend / script_utils` 全部通过；依赖版本（scipy 1.17.1、biotite 1.4.0）未漂移
+- **历史任务链路完好**：用 4 条真实历史路径串（旧根绝对路径、旧相对串、target 路径）做下载回归，全部正确解析到 `runtime/` 新位置并通过下载白名单，历史任务的结果下载/结构可视化不受重构影响
+- **458 个文件全部被 git 识别为 rename**，目录移动历史在版本库里清晰可追溯；分两次提交（清理 / 重构）便于分别回滚
+- **新人可读性显著提升**：根目录从 30+ 平铺目录变为 18 个语义分层目录（平台核心 / 工具 / 第三方 / 部署 / 运行数据 / 文档），vendor 目录正式内化，`wiki/directory-map.md` 重建为可导航的目录地图
+- 顺带修掉一个部署脚本 bug：`deploy/migrate-from-132.sh` 中未定义的 `$PROJECT_DIR` 改为 `$PROJECT`
+
+### 遇到的问题及解决
+- **可编辑安装的包装映射陷阱**：首次 `uv pip install -e .` 后 `.pth` 只剩 `src/third_party/tools` 三条，`import openfold` 等 4 个 community_models 子包全部失败。根因是 hatch 的"包装映射"（`third_party/community_models = community_models`）遮蔽了子包映射，且未包含 `ProteinHarness`；移除包装映射、显式列出 4 个子包并补上 `ProteinHarness` 后 `.pth` 恢复 7 条等价结构
+- **依赖被降级**：`uv pip install -e .` 按 pyproject pin 把 scipy 1.17.1→1.12.0、biotite 1.4.0→0.41.2（与 `deploy/build_uv_env.sh:227` 本就有的 biotite 版本重置步骤呼应）；每次重装后执行 `uv pip install "biotite==1.4.0" "scipy==1.17.1"` 恢复运行版本
+- **2 个测试被自己引入的失败**：`legacy_inference_dir` 我加了 `runtime/` 前缀，但测试 mock 注入 `INFERENCE_DIR` 后调用方传的是 `INFERENCE_DIR.parent`，造成 `runtime/runtime` 双重路径；修复为函数恢复 `project_root / "inference"`、调用方统一传 `INFERENCE_DIR.parent`，并补 docstring 明确参数语义
+- **`.gitignore` 陷阱**：`/tools/` 规则会忽略新建的 `tools/` 层（父目录被排除后 `!` 无法救回），必须删除该行；裸 `logs/` 规则同时覆盖 `Backend/logs`，故保留不动
+- **`git mv env deploy` 产生嵌套**（`deploy/` 已预先创建，结果成 `deploy/env/`）：`shopt -s dotglob && mv deploy/env/* deploy/ && rmdir deploy/env` 修正；另处理 21 个索引过时状态（`RD`）
+- **测试污染仓库根**：`tests/test_esmfold2_adapter.py` 会在仓库根写出 `esm`/`esm_1~3` 假 PDB，已清除并写入项目记忆提醒
+- **`pkill -f "uvicorn main:app"` 误杀自身 shell**：改用 `pgrep` 确认状态后重新 nohup 启动，最终 openapi 200 / runs 403（鉴权正常）
+
+### 下一步计划
+- 修复遗留的 systemd 部署单元：`/etc/systemd/system/bindagent.service` 仍指向已不存在的 `Proteina-Complexa` 目录（后端目前靠手动 nohup 运行），需 `sudo bash deploy/update-system.sh` 修正；同时统一单元名（`deploy-local.sh` 用 `ProteinCraft` vs `update-system.sh`/`restart-bindagent.sh` 用 `bindagent`）
+- `docs/Literature_Agent_UI_Analysis.md` 等一次性分析文档可评估归档
+- 两个提交尚未推送到远端，待确认后推送
