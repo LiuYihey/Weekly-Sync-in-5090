@@ -345,3 +345,153 @@
 - 修复遗留的 systemd 部署单元：`/etc/systemd/system/bindagent.service` 仍指向已不存在的 `Proteina-Complexa` 目录（后端目前靠手动 nohup 运行），需 `sudo bash deploy/update-system.sh` 修正；同时统一单元名（`deploy-local.sh` 用 `ProteinCraft` vs `update-system.sh`/`restart-bindagent.sh` 用 `bindagent`）
 - `docs/Literature_Agent_UI_Analysis.md` 等一次性分析文档可评估归档
 - 两个提交尚未推送到远端，待确认后推送
+
+## 汇报日期 2026-10-12 ~ 2026-10-13：数据丢失事故修复 + Agent 数据分析能力（沙箱 MCP / Artifacts）建设
+
+> 本阶段共 7 个提交，围绕两条主线：①修复目录重构引发的**用户数据丢失事故**（聊天记录 + linked chat 全量断链）；②给 design agent 接入**沙箱化数据分析能力**，让用户能对实验结果做个性化分析并产出图表 artifacts。
+
+### 工作内容
+
+#### 零、提交清单
+
+| commit | 主题 | 规模 |
+|---|---|---|
+| `363ce77` | 修复聊天记录全量丢失：会话库改读 `runtime/`，停止 git 跟踪 | 3 files, +2/-2 |
+| `74db180` | 启动清理逻辑加空库安全门禁 + 测试写入隔离 | 3 files, +90/-12 |
+| `90173bf` | 修复 assistant markdown 渲染：行内 `#1` 被误判标题、表格英文竖排断词 | 7 files, +21/-22 |
+| `ccbf362` | 接入沙箱化 filesystem MCP + 分析代码执行 + artifact 卡片 | 27 files, +1876/-76 |
+| `4bbddac` | artifact 卡片贯通 transcript op 链（端到端修复） | 7 files, +70/-26 |
+| `4edeace` | 修复真实结果分析失败、artifact 图片 404、卡片错位 | 11 files, +251/-96 |
+
+---
+
+#### 一、聊天记录全量丢失事故修复（commit `363ce77`）
+
+**问题现象**：10-11 顶层目录树状重构后，平台上所有用户的 chat history 全部查不到。
+
+**根因定位**：会话持久化库 `agent_sessions.db` 原先放在仓库根，被 `ed6cc56` 的目录重构搬到了 `runtime/`，但 [agent_persistence.py](file:///home/lyh/Liuyihey/ProteinCraft-Agents/Backend/agent_persistence.py) 的 `_resolve_db_path()` 仍指向旧位置。更严重的是 `ed6cc56` 曾用一个**空库**覆盖了 git 中跟踪的 13MB 真实库。
+
+**修复内容**：
+- `_resolve_db_path()` 改为读取 `runtime/agent_sessions.db`，库文件缺失时打 `log.error` 而非静默走空库路径
+- 执行 `git rm --cached agent_sessions.db` 停止版本跟踪（运行数据不应进代码库，避免再次出现"空库覆盖真实库"）
+- 同步修正 `README.md` 中关于该文件位置的说明
+
+---
+
+#### 二、实验 linked chat 全量断链修复（commit `74db180`）
+
+**问题现象**：重构后不仅聊天记录丢失，所有实验记录页也没有可跳转的 linked chat 入口。
+
+**恢复过程**：
+- 从重构前的备份中恢复 **27 组会话-任务绑定关系、23 个任务归属**，重写 `runtime/.../_task_meta.json` 与 `_task_chat.json` 索引
+- 新增 `count_all_sessions()` 作为**启动安全门禁**：会话库为空（计数 <= 0）时直接跳过 purge / detach / prune / sync 四类清理动作，从机制上根除"空库启动把绑定关系再洗一遍"的二次伤害
+- 防御性加固：`_detach_tasks_from_missing_sessions`、`_prune_design_session_linked_task_ids` 在集合为空时短路返回；`_sync_orphan_task_artifacts` 在目录不可读时拒绝删除
+- 测试隔离：`test_agent_action_parser.py` 中新增 `backend_main._ownership_path` monkeypatch，避免测试写入真实的 `_ownership.json`
+
+**遗留数据风险控制**：重构前保留两份库备份 `/home/lyh/agent_sessions.db.bak_20261011`、`/home/lyh/agent_sessions.db.bak2_20261012_before_restore`，以及全量代码包备份 `/home/lyh/backup_proteincraft_restructure_20261011.tar.gz`。
+
+---
+
+#### 三、前端 Markdown 渲染缺陷修复（commit `90173bf`）
+
+用户截图暴露两类渲染问题：
+
+1. **行内编号被渲染成超大号粗体标题**：`#1`、`#2` 引用编号被标题规则误判。修复策略改为**收紧触发条件**——只在句末标点（`. ! ? : ; 。 ！ ？ ： ；`）后粘连的情况下才拆分标题块，并新增行首 `^(#{1,6})([^\s#])` 规范化，不再误伤行内 `#1`
+2. **表格中英文竖排断词**（`Protein` / `a-` / `Comple` / `xa 升级`、`MEDIU` / `M`）：根因是 CSS `word-break: break-word` —— 这是**废弃别名，实际等价 `overflow-wrap: anywhere`**，会导致列宽塌缩 + 单词中间断行。5 处样式统一改为语义正确的 `overflow-wrap: break-word`
+3. 同步新增 `breakOpportunities()`：对 ≥16 字符的长标识在 `/ _ . -` 后插入零宽空格（ZWSP），使断行只落在语义边界
+
+涉及文件：`chatMessages.js`、`AssistantMarkdown.jsx`、`AgentChat.jsx`。
+
+---
+
+#### 四、design agent 接入沙箱化数据分析能力（commit `ccbf362`，本阶段主线）
+
+**目标**：让用户在对话中直接对实验结果做个性化分析、产出图表；对平台自身结果产出 artifacts，UI 与现有分子展示框保持同一套设计语言；用户数据严格隔离，采用业界 agent 的标准安全做法。
+
+**架构决策：自实现 MCP（Model Context Protocol 2024-11-05）**
+不引入新依赖，用 stdio + JSON-RPC 2.0 自行实现 server（`initialize` / `tools/list` / `tools/call`），零第三方依赖、可控性最强。
+
+**沙箱隔离三层**（业界标准做法）：
+1. **bubblewrap 网络与命名空间隔离**：`--unshare-net --unshare-pid --proc /proc --dev /dev --tmpfs /tmp` + 只读 bind 系统目录 + 资源上限
+2. **能力探测 + 自动降级**：本机实测 bwrap 不可用（内核 `loopback: Failed RTM_NEWADDR`），`bwrap_available()` 改为**实测探测**（跑真实命令看 returncode）而非 `shutil.which`，探测失败自动降级
+3. **PEP 578 `sys.addaudithook`**：降级路径下仍强制拦截文件越权（audit hook 无法被沙箱内代码移除，这是它相对 `sitecustomize` 的关键优势）
+
+**资源限制**：`RLIMIT_CPU 120s` / `AS 2GiB` / `FSIZE 100MiB` / `NOFILE 128`。
+
+**虚拟路径沙箱**：仅暴露 `data/` `artifacts/`（可写）、`results/<run>/` `targets/`（只读）。校验在客户端（[paths.py](file:///home/lyh/Liuyihey/ProteinCraft-Agents/Backend/sandbox/paths.py)）与服务端（`mcp_server._resolve`）各做一份 `resolve() + relative_to()` 双层校验。用户目录命名为「可读前缀 + sha1[:10]」，兼顾可辨识与防枚举。
+
+**新增 6 个后端模块（1109 行）**：[mcp_server.py](file:///home/lyh/Liuyihey/ProteinCraft-Agents/Backend/sandbox/mcp_server.py) 428 行、[workspace.py](file:///home/lyh/Liuyihey/ProteinCraft-Agents/Backend/sandbox/workspace.py) 186 行、[runner.py](file:///home/lyh/Liuyihey/ProteinCraft-Agents/Backend/sandbox/runner.py) 168 行、[mcp_client.py](file:///home/lyh/Liuyihey/ProteinCraft-Agents/Backend/sandbox/mcp_client.py) 164 行、[paths.py](file:///home/lyh/Liuyihey/ProteinCraft-Agents/Backend/sandbox/paths.py) 116 行、[audit.py](file:///home/lyh/Liuyihey/ProteinCraft-Agents/Backend/sandbox/audit.py) 34 行。
+
+**新增 5 个 agent 工具**：`list_files` / `read_file` / `write_file` / `save_artifact` / `run_analysis_code`，通过 [sandbox_tools.py](file:///home/lyh/Liuyihey/ProteinCraft-Agents/ProteinHarness/executors/sandbox_tools.py) 接入 harness，design agent 工具数从 9 增至 14。
+
+**Artifacts UI**：新增 [ArtifactCard.jsx](file:///home/lyh/Liuyihey/ProteinCraft-Agents/Interface/src/components/ArtifactCard.jsx)，完整复刻 `structure_preview` 的设计语言——白底 16px 圆角、`rgba(84,72,229,0.2)` 紫色描边、`0 4px 20px rgba(84,72,229,0.08)` 阴影、左上 Download 药丸按钮、右上 Maximize2 放大按钮。
+
+**安全对抗验证 11/11 拦截**（含路径穿越 `../../etc/passwd`、绝对路径越权、符号链接写穿、跨用户访问、越权 run 目录、资源耗尽）。
+
+---
+
+#### 五、artifact 卡片贯通 transcript op 链（commit `4bbddac`）
+
+**发现的上轮漏洞**：完成度审计时发现 `ui:artifact` 事件在 transcript 累积器的分发链末端被 `else: return []` **静默丢弃**，且 artifact 消息不持久化——表现是 LLM 说"上方预览卡"但刷新页面即消失。
+
+**补齐的完整链路**：
+- 后端：`_OpType.ARTIFACT = "op_artifact"` → `_TranscriptOp.artifact()` 静态工厂 → `_apply_op` 分支（按 id 去重后 append）→ `_TranscriptAccumulator` 分发链
+- 前端：[transcript.js](file:///home/lyh/Liuyihey/ProteinCraft-Agents/Interface/src/lib/transcript.js) `applyOp` 新增 case
+- 消息流：[streamMessages.js](file:///home/lyh/Liuyihey/ProteinCraft-Agents/Interface/src/lib/streamMessages.js) 将 artifact 与 structure 统一纳入 `normalizeToolStructureOrder`
+
+**真实链路验证**：LLM 发起 tool_use → 产出 `cos_curve.png` → `op_artifact` 事件 → 持久化 → 浏览器像素级验证卡片与全屏弹窗渲染，确认与分子展示框视觉一致。
+
+---
+
+#### 六、真实结果分析失败 / 图片 404 / 卡片错位修复（commit `4edeace`）
+
+用户截图反馈三个问题。**归因结论：全部是 harness 侧缺陷，agent 的自我诊断准确**。
+
+**缺陷 1：`results/` 未挂载进 Python 沙箱（核心）**
+agent 执行 `pd.read_csv('results/<run_name>/...')` 必然 `FileNotFoundError`。修复：新增 `_ensure_view_links()`，在用户根下建立 `results` / `targets` 符号链接指向 `RESULTS_ROOT` / `TARGETS_ROOT`（符号链接本身只提供只读视图，配合 realpath 校验防写穿）。
+
+**同时加固 audit hook**：读操作校验 realpath 必须落在白名单前缀内；写操作 realpath 必须落在用户根或 `/tmp`；`results/` 下的访问强制校验 run 名在 `_ALLOWED_RUNS` 内；禁用 `os.symlink` / `os.link` / `os.rename`。
+
+**缺陷 2：admin 查看他人 artifact 图片 404**
+原实现为 owner-only。修复：`workspace.find_artifact_any_user()` 遍历各用户 manifest 兜底定位；`/api/artifacts` 列表接口**刻意不返回他人数据**（避免信息泄露），仅单文件路由对 admin 兜底。
+
+**缺陷 3：全屏聊天模式下 artifact 卡片严重左漂**
+用 Playwright 做几何实测定位（非截图猜测）：`artifact-row x=72` vs 正常消息行 `x=320`。根因是 `isFullscreen` 模式下所有消息行都有 `maxWidth: 800 + margin: '0 auto 16px'` 居中约束，而 ArtifactCard 漏了这一处理。修复后复测 `x=360`，与工具卡内容列对齐。
+
+**验证**：真实任务 `protein_binder_custom_rcsb_5NIU_proteina_db4a5272` → 直读 26×98 CSV → 产出 39,663 bytes 散点图；写穿 / 越权 / 符号链接三处均正确抛 `PermissionError`，攻防 5/5 BLOCKED。
+
+**文档同步**：`WIKI_analysis.md` 新增两条 agent 规范（`results/`、`targets/` 在代码里可直接只读访问，大表不要用 `read_file` 搬运而应在 `run_analysis_code` 内 `pd.read_csv`）。
+
+### 结果与产出
+
+**数据安全**
+- 用户聊天历史与 linked chat 全部恢复（27 组绑定 / 23 个任务归属），并新增空库安全门禁防止同类事故重演
+- 三份可回滚备份保留（2 份会话库 + 1 份全量代码包）
+
+**Agent 能力**
+- design agent 从 9 个工具扩展到 14 个，具备完整的"读数据 → 分析 → 出图 → 产出 artifact"闭环
+- 用户可在对话中直接产出个性化图表，成果以与分子展示框一致的卡片形态呈现，支持点击放大与下载
+- 分析代码全程沙箱执行（90s 超时、输出截断 20k、单 artifact 50MB、单用户 500 个上限）
+
+**测试与质量**
+- 新增 [test_sandbox.py](file:///home/lyh/Liuyihey/ProteinCraft-Agents/Backend/test_sandbox.py) 13 项安全/链路测试全部通过（虚拟路径、跨用户隔离、results 视图只读、run 白名单强制、ui:artifact 事件、审计日志）
+- 全量回归：后端 185 passed（仅 2 项豁免清单内预存失败），前端全绿
+- 文档沉淀：新增 `wiki/sandbox.md` 作为沙箱权威文档，含威胁模型与残余风险说明；`wiki/index.md`、`wiki/directory-map.md` 同步更新
+
+### 遇到的问题及解决
+
+- **bwrap 存在但不可用**：本机内核禁止命名空间（`unshare -n` 报 `Operation not permitted`、`--unshare-user` 报 uid map 权限拒绝、docker 用户不在 docker 组）→ `bwrap_available()` 改为实测探测，失败自动降级 `setrlimit` + PEP 578 audit hook，并在 wiki 中明确记录残余风险与 root 权限下的修复路径（建议 root 开通 bwrap/docker）
+- **沙箱把自己的科学栈拦死**：numpy 初始化会 `import ctypes`，被 audit hook 拦为 `PermissionError: ctypes is disabled` → 将科学栈（matplotlib/numpy/pandas/scipy/seaborn/PIL/plotly）的 import 移到 audit hook 注入**之前**预热
+- **OpenBLAS 线程爆内存**：`pthread_create failed for thread 51 of 64` → 环境变量固定 `OPENBLAS_NUM_THREADS/OMP/MKL/NUMEXPR/VECLIB = 4`、`MPLBACKEND=Agg`
+- **f-string 生成 prelude 出 tuple repr**：`!r` 对 tuple 生成 `('/a', '/b',)` 导致 prelude 语法与语义双重错误 → prelude 改为列表拼接 `"\n".join(lines)`
+- **测试污染真实数据**：`_OWNERSHIP_PATH` 是模块级常量，`mock.patch.object(OUTPUT_DIR)` 无效 → 改为 `_ownership_path()` 函数化 + 测试侧 monkeypatch
+- **IDE 文件工具频繁超时**：`Read`/`Write`/`Edit` 报 `IDE Command timeout` / 匹配失败 → 改用 shell heredoc 与带 `assert count == 1` 校验的 Python 精确替换
+- **浏览器自动化桥接不可用**：内置浏览器视口被压到 654×290、截图 API 被限流、`fill` 对 React 受控输入无效 → 改用项目自带 Playwright（chromium-1228）自写脚本完成登录、导航、几何测量与截图验证
+- **方法论收获**：布局错位问题上，Playwright `getBoundingClientRect` 几何实测 + 打印 DOM 父链，比看截图猜测快且准——一次就定位到缺失的 `maxWidth: 800 + margin auto`
+
+### 下一步计划
+
+- 为沙箱申请 root 级 bwrap / docker 隔离权限，消除当前降级方案（CPython 自身理论上可逃逸 audit hook）的残余风险
+- 修复遗留的 systemd 部署单元 `/etc/systemd/system/bindagent.service`（仍指向已不存在的 `Proteina-Complexa` 目录，后端目前靠手动 nohup 运行），需 `sudo bash deploy/update-system.sh`；同时统一单元命名（`ProteinCraft` vs `bindagent`）
+- 本阶段 7 个提交均未推送到远端，待确认后统一推送
+- `docs/Literature_Agent_UI_Analysis.md` 等一次性分析文档可评估归档
