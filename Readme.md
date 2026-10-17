@@ -495,3 +495,79 @@ agent 执行 `pd.read_csv('results/<run_name>/...')` 必然 `FileNotFoundError`�
 - 修复遗留的 systemd 部署单元 `/etc/systemd/system/bindagent.service`（仍指向已不存在的 `Proteina-Complexa` 目录，后端目前靠手动 nohup 运行），需 `sudo bash deploy/update-system.sh`；同时统一单元命名（`ProteinCraft` vs `bindagent`）
 - 本阶段 7 个提交均未推送到远端，待确认后统一推送
 - `docs/Literature_Agent_UI_Analysis.md` 等一次性分析文档可评估归档
+
+---
+
+## 汇报日期 2026-10-18：实验流水线三类崩溃修复（PXDesign evaluate / DockQ / Genie 3）+ 前端渲染与展示优化
+
+### 工作内容
+
+本阶段集中处理了 5 个用户直接反馈的问题，覆盖后端实验流水线、外部模型 wrapper、前端渲染与展示、运维文档，全部以运行时证据（真实日志、真实 PDB 打分、真实 YAML 解析）定位根因，而非静态推测。
+
+#### 一、PXDesign 实验 `Step 'evaluate' failed with exit code 1` 修复
+
+**用户明确指出 agent 自身的归因方向错误**（agent 猜测是 JSON 序列化 numpy/NaN 问题）。实读运行日志 `runtime/logs/evaluate_*_pxdesign_*.log` 后定位真实链路：三个骨架的 evaluate 阶段并发争抢同一块 GPU → `predict_esmfold2.py` 加载模型时 CUDA OOM → `mpnn_seq_2` 拿不到 refolded PDB → `binder_metrics.py` 直接 `raise RuntimeError` 拖死整个子进程 → 聚合 CSV 永不写出 → `n_designs=0`。
+
+修复共 4 处配套改动：
+- `src/proteinfoundation/metrics/binder_metrics.py`：新增模块级常量 `_PROT_PROT_RMSD_KEYS` / `_LIGAND_RMSD_KEYS`，缺失 refolded 结构时写入 `None` 占位并 `continue`，不再抛异常拖垮整批
+- `src/proteinfoundation/evaluation/binder_eval_utils.py`：`compute_composite_ranking_score` 遇到指标缺失/None/NaN/inf 时返回 `inf`（判为无效样本）——**顺带修掉一个连锁 bug**：原逻辑缺失指标时 `continue` 会给 0 分，而 0 分恰是排序最优，导致"坏占位反而当选 best"
+- `src/proteinfoundation/evaluation/binder_eval.py`：`_all` 列表推导由 `s[metric]` 改为 `s.get(metric)`，混合好坏样本不再 KeyError（共 2 处）
+- `src/proteinfoundation/utils/esmfold2_utils.py`：失败占位由 `float("nan")` 改为 `None`，保证 JSON 合法
+
+#### 二、DockQ 崩溃 `ValueError: Buffer has wrong number of dimensions (expected 2, got 1)` 修复
+
+根因：ProteinMPNN 对 binder 做了完全重设计，model 链 C（`SAAAA…EAAAAA`）与 native 链 Z（`GERERR…RLEELE`）同源度 0% → DockQ 序列对齐得到 0 个匹配列 → `get_aligned_residues` 返回空集 → `np.asarray([])` 产生一维数组传入 Cython 核心。附带问题：同源二聚体靶点下 native 链（A,B,Z）与 refold 链（A,B,C）命名不同，仅补 `--mapping` 仍会崩。
+
+修复重写 `Backend/main.py::_run_dockq_for_pair()`：**始终显式钉住链配对**（`_ordered_chain_ids_from_pdb` + `_build_dockq_mapping`），因为位置映射在此场景下是正确的（两个文件都是靶点链在前、binder 在后）；主命令失败时追加 `--no_align` 按残基编号重试。同时删除已无用的 `_dockq_chain_error()`。
+
+#### 三、Genie 3 崩溃 `TypeError: join() argument must be str, bytes, or os.PathLike object, not 'int'` 修复
+
+根因：`RunRequest.run_name` 可为纯数字（本次为 `71817870`），wrapper 生成 YAML 时字符串字段未加引号，YAML 把 `name: 71817870` 推断为 int，外部 `prepare.py` 在 `os.path.join(outdir, config.name)` 处崩溃，generate 阶段整体失败。
+
+修复：在 `src/proteinfoundation/model_wrappers/wrapper_base.py` 新增共享 `yaml_str()`（基于 `json.dumps`，输出合法的 YAML 双引号标量）；`genie3_wrapper.py` 的 problem/experiment 两份配置全部字符串字段改用 `yaml_str`（数字字段如 `min_length`/`n_sample` 保持不加引号）；**主动预防性修复** `rfdiffusion3_wrapper.py` 的同类隐患（run_name 直接作 YAML 顶层 key），本机已配置该骨架执行路径。
+
+#### 四、聊天气泡 `<tool_call>` 文本泄漏修复 + 任务列表模型名展示优化
+
+- `Interface/src/lib/chatMessages.js` 新增 `sanitizeAssistantText()`，清洗 5 类泄漏模式：完整 `<tool_call>` 块、未闭合的尾部 `<tool_call>`、`<invoke>` 块（半开式匹配到 `</invoke>` 或文末）、孤立闭合标签、provider artifact 残留。根因是模型把工具调用当正文以文本形态输出，而非走 Anthropic Messages API 原生 `content_block_start` / `input_json_delta` 工具通道。
+- `Interface/src/lib/backboneModels.js` 新增 `backboneFromRunName()`，从冗长的 `run_name`（如 `protein_binder_custom_a8a2aae4_CD8_aa22_137_boltzgen_60d5af1a`）反查骨架模型名。`TaskList.jsx` 改为 `backbone_label || backboneFromRunName(run_name) || run_name` 三级回退，界面仅显示"BoltzGen / PXDesign / Genie 3"，完整 run_name 保留在 title 悬停提示。
+
+#### 五、沙箱原理文档 + 运维文档更新
+
+- 新增 `wiki/sandbox_how_it_works.md`：5 张 ASCII 图讲清沙箱 / filesystem MCP / `list_files` 三者关系、平台请求 → wrapper → 外部模型 → mcp_client → mcp_server → 磁盘的完整链路、虚拟路径与真实目录的映射表、四层隔离、一次 `list_files` 的完整旅程、artifacts 去向与 FAQ（明确回答"它是否有实质文件夹"）
+- 重写 `docs/archive/zui_core_notes/前后端重启流程.md`：全部路径 `Proteina-Complexa` → `ProteinCraft-Agents`、`env/` → `deploy/`；**纠正上一份汇报中"后端靠手动 nohup 运行、systemd unit 未修复"的过时结论**（实测 Main PID 与 8081 监听进程一致，cgroup 为 `system.slice/bindagent.service`，已由 systemd 接管）；新增 systemd 自检命令、nohup 冲突警告、pyproject 依赖降级提醒
+- `wiki/index.md` 同步索引与快速导航
+
+### 结果与产出
+
+**修复效果（全部经真实数据验证）**
+
+| 问题 | 根因 | 验证结果 |
+|---|---|---|
+| PXDesign evaluate exit 1 | ESMFold2 CUDA OOM → 单个坏样本 raise 拖死整批 | ranking 逻辑脚本验证：坏占位判 inf、best 选取正确 |
+| DockQ Buffer 维度崩溃 | MPNN 全重设计导致 0% 同源，序列对齐返回空残基集 | 崩溃样本对 3 个界面全部成功打分（AB:AB DockQ 0.906）；bindcraft 健康样本无回归；`test_dockq.py` 3/3 通过 |
+| Genie 3 join() TypeError | YAML 未加引号 → 纯数字 run_name 解析为 int | 端到端 `yaml.safe_load` 断言全过（problems.yaml / experiment.yaml / rfdiffusion3 inputs.yaml 三份均确认为 str）；`test_model_wrappers.py` 21/21 通过 |
+| tool_call 文本泄漏 | 模型以正文形态输出工具调用，非原生工具通道 | 前端单测 38/38 通过 + 前端 build 已部署到 `Backend/static` |
+| 任务列表模型名不可读 | 后端已提供 `backbone_label`，前端未使用 | 前端单测 42/42 通过 + build 已部署 |
+
+**质量保障**
+- 新增 3 个测试文件 / 2 组回归测试：`chatMessages.test.js`（6 项清洗用例）、`backboneModels.test.js`（4 项解析用例）、`test_genie3_configs_quote_numeric_names`、`test_rfdiffusion3_inputs_quote_numeric_run_name`
+- 全部改动通过 `py_compile` 与 `node --test` 校验
+- 改动均无需重启后端即可生效：前端 build 即可；wrapper 以子进程 `python -m` 拉起，每次调用重新加载；DockQ 逻辑每次调用重新读取
+
+**经验沉淀**
+- 项目记忆库新增 3 条：systemd 进程管理现状（修正旧错误记忆）、DockQ post-eval 修复、wrapper YAML 纯数字 run_name 坑
+
+### 遇到的问题及解决
+
+- **agent 自我归因错误**：首次分析 PXDesign 失败时凭直觉猜"JSON 序列化"，被用户否定。改为坚持读真实运行日志定位到 CUDA OOM，这是本次能修对的转折点——**实验类问题必须以运行时证据为准，不能靠代码静态推断根因**
+- **DockQ 是双层 bug**：序列对齐为空是表层，靶点链命名不一致是深层。只修一层仍会崩，必须"显式 mapping + `--no_align` 兜底"组合。验证过程中还发现单独使用 `--no_align` 会报 "no identical corresponding chain"，两者必须同时使用
+- **健康回归检查路径猜错**：第一次按猜测路径查健康样本的 refold 产物不存在，实际目录与文件名都不同。改为从 `_ownership.json` 顺真实任务名定位
+- **测试预期值写错（自查发现）**：`chatMessages.test.js` 首轮 2 个用例失败，原因是预期值没按正则真实行为写（删除 `<invoke>` 块后残留空行、provider artifact 清理后的实际结果）。修正为真实行为后全绿
+- **IDE 文件工具间歇性故障**：`Edit` 会给 `old_str` 加幽灵前缀 `": "` 导致匹配失败，`Write` 报 `IDE Command timeout`。确认目标文件本身正常（LF、无 BOM、CRLF 计数为 0）后，改用 Shell + Python heredoc 精准替换，脚本内先断言 `s.count(old) == 1` 再执行 `replace`，杜绝误替换
+
+### 下一步计划
+
+- **失败任务需人工在界面 resume**：genie3 `..._genie3_302f4e24`（evaluate 已完成，仅挂在 dockq 后处理，修复后可直接 resume）、genie3 `71817870`（generate 阶段失败，需完全重跑）
+- **PXDesign 重跑需等 GPU 释放**：需等 Genie 3 / BoltzGen 的 evaluate 阶段跑完后再重跑，避免再次触发并发 OOM
+- **本阶段改动尚未提交**：共 4 组改动（前端渲染与展示 / 后端评估与 DockQ 修复 / wrapper YAML 引号 / 文档），待确认后按模块拆分提交
+- **建议**：评估给 ESMFold2 evaluate 阶段加并发闸门或显存水位检查，从源头避免 OOM 而非仅做事后降级
