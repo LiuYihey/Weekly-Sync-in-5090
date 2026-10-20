@@ -688,3 +688,62 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - **主仓库 22 项未提交改动**（前端渲染 / 后端评估 / wrapper YAML / 文档）待管理员确认后按模块拆分提交
 - **主仓库 `.gitignore` 同样存在根锚定规则失效隐患**，待与协作者分支的修复一并同步
 - **建议评估给 ESMFold2 evaluate 阶段加并发闸门或显存水位检查**，从源头避免并发 OOM 而非仅做事后降级
+
+## 汇报日期 2026-10-20（续）：平台界面 Rosetta 命名统一为 FreeRosetta
+
+### 工作内容
+
+将平台前端所有以 "Rosetta" 呈现给用户的显示字段统一更名为 "FreeRosetta"，改动范围严格限定在「界面显示命名」，不触碰任何计算逻辑、产件文件名与后端接口。
+
+**排查阶段**
+
+- 全仓 Grep `Rosetta|rosetta`（不区分大小写），命中 19 个文件，逐个甄别「用户可见文案」与「内部标识 / 第三方库名」
+- 确认真正的显示层改动面只有 2 个源文件：`Interface/src/i18n/LanguageContext.jsx`（中英文案表）、`Interface/src/pages/LandingPage.jsx`（首页模型滚动条）
+- 其余命中项全部属于内部标识或第三方内容，**明确不改**：
+  - i18n key 名（`val_section_rosetta` 等）、section id（`'rosetta'`）、局部变量名（`hasRosetta`）
+  - 产件文件名 `rosetta_interface.csv` 及其后端读取链路（`Backend/main.py`、`ProteinHarness/plan_manager.py`）
+  - 第三方库 `third_party/community_models/colabdesign/**` 内的 `trrosetta.py`、`tr/model.py`
+  - 文档 `docs/**`、`Backend/memory_analysis.py`、历史构建产物 `Backend/static/assets/*.js`
+
+**改动明细**
+
+`Interface/src/i18n/LanguageContext.jsx` —— 中英文各 9 处，共 18 处文案：
+
+| key | 改前 | 改后 |
+|---|---|---|
+| `val_section_rosetta` | Physical energy (Rosetta) | Physical energy (FreeRosetta) |
+| `val_section_rosetta_desc` | Rosetta InterfaceAnalyzer binding energy… | FreeRosetta InterfaceAnalyzer binding energy… |
+| `val_source_rosetta` | Rosetta | FreeRosetta |
+| `val_metric_dg` | ΔG (Rosetta) | ΔG (FreeRosetta) |
+| `val_how_dg` | Rosetta InterfaceAnalyzer separated binding energy… | FreeRosetta InterfaceAnalyzer separated binding energy… |
+| `val_how_complex_energy` | Total Rosetta energy of the bound complex | Total FreeRosetta energy of the bound complex |
+| `badge_evaluate_desc` | Rosetta dG … PyRosetta InterfaceAnalyzer | FreeRosetta dG … FreeRosetta InterfaceAnalyzer |
+| `metric_dg` | ΔG (Rosetta) | ΔG (FreeRosetta) |
+| `metrics_section_rosetta` | PHYSICAL ENERGY · Rosetta InterfaceAnalyzer | PHYSICAL ENERGY · FreeRosetta InterfaceAnalyzer |
+
+`Interface/src/pages/LandingPage.jsx`：
+
+- 首页模型滚动列表 `PyRosetta` → `FreeRosetta`，并同步对齐列宽空格
+- `RoseTTAFold3` **保持不动**（名称中虽含 "Rose"，但与 Rosetta 并非同源产品，属误伤风险点）
+
+### 结果与产出
+
+- 全部 Rosetta 相关展示位已统一显示为 FreeRosetta，中英文同步：指标校验面板的物理能量分区、任务详情 Evaluate 步骤说明、任务级 ΔG 指标卡、首页模型滚动条
+- **零逻辑改动**：`dG_separated` / `complex_energy` / `interface_dSASA` 等字段名、`rosetta_interface.csv` 产件、后端 pipeline 全部原样保留，存量历史任务与已有结果数据渲染不受影响
+- 前端重新构建并按仓库既有流程上线：`npm run build` 成功（6.58s），产物 `dist/assets/index-BbVp7Y8O.js`（1.79 MB，gzip 508 KB），`rsync -a --delete dist/ ../Backend/static/` 同步至线上静态目录，旧 hash 产物 `index-CQjxsayh.js` 按规范清除、`index.html` 引用更新
+- 产物校验：对新 bundle 提取全部 `*Rosetta` 匹配串，结果仅剩 `FreeRosetta` 一种形态，**无裸 "Rosetta" 残留**
+- 回归测试：`npm run test:unit` 共 42 项全部通过（5 suites / 0 fail）
+
+### 遇到的问题及解决
+
+- **IDE 读取超时**：首次读取 `Interface/package.json`、`vite.config.js`、`Backend/static/index.html` 时命令级 timeout，改为 shell 直接读取绕过，不影响结论
+- **Glob 全仓匹配超时**：`Glob **/*rosetta*` 在仓库根超时，改为限定 `Interface/`、`Backend/`、`configs/`、`ProteinHarness/` 分目录 Grep，效率与准确性均更好
+- **同名误伤甄别**：首轮检索命中 `RoseTTAFold3`，关键词包含但产品不同源，逐一确认后明确排除
+- **"只改显示"的口径界定**：存在「是否连 i18n key 一并改名」两种方案。按需求选择保留 key / section id / 变量名不动、只替换文案值，使 i18n 字典、`validationMetrics.js` 的 section 映射、`MetricsCard.jsx` 调用侧零改动，改动面收敛到纯展示层
+- **上线路径辨析**：`Interface/dist/` 并未被 git 跟踪（`git ls-files Interface/dist` 为空），真正生效的产物在 `Backend/static/`，故执行 build + rsync 同步，而非仅 build
+
+### 下一步计划
+
+- 观察线上效果：校验面板 / 任务详情 / 首页滚动条的 FreeRosetta 显示与中英文切换，重点关注 `ΔG (FreeRosetta)` 标签较原名长 4 字符，在窄屏 MetricItem 内的换行表现
+- 本次按「只改前端显示」要求未动 `docs/RESULT_FILES_OVERVIEW.md`、`docs/INFERENCE.md` 等文档中的 Rosetta 表述，待统一口径后再同步
+- 若后续希望做彻底命名统一（i18n key / section id / 产件文件名一并改），需单独评估对存量历史任务、已生成 CSV 与后端解析逻辑的兼容性影响
