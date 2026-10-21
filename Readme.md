@@ -747,3 +747,50 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - 观察线上效果：校验面板 / 任务详情 / 首页滚动条的 FreeRosetta 显示与中英文切换，重点关注 `ΔG (FreeRosetta)` 标签较原名长 4 字符，在窄屏 MetricItem 内的换行表现
 - 本次按「只改前端显示」要求未动 `docs/RESULT_FILES_OVERVIEW.md`、`docs/INFERENCE.md` 等文档中的 Rosetta 表述，待统一口径后再同步
 - 若后续希望做彻底命名统一（i18n key / section id / 产件文件名一并改），需单独评估对存量历史任务、已生成 CSV 与后端解析逻辑的兼容性影响
+
+
+## 汇报日期 2026-10-22：BindCraft 多链靶点 evaluate 步骤崩溃修复（链合并问题）
+
+### 工作内容
+
+排查并修复平台报错 `Step 'evaluate' failed with exit code 1`。该错误出现在 BindCraft 蛋白质 binder 设计任务（CD8 同源二聚体靶点 `custom_a8a2aae4_CD8_aa22_137`，target_input `A1-116,B1-116`）的 evaluate 阶段，同一靶点的 Genie 3 / PXDesign 任务均正常，仅 BindCraft 必现。
+
+**根因定位**
+
+- 从 `runtime/logs/` 的 evaluate 日志提取到完整堆栈：`ValueError: target_settings['starting_pdb_chains'] (['A', 'B']) length must match target_settings['chains'] (['A'])`，抛出点在 `src/proteinfoundation/utils/esmfold2_utils.py:134`
+- 逐层溯源：`binder_eval.py` 从生成 PDB 检测链（`binder_chain=chains[-1]`、`gen_target_chain=chains[:-1]`）→ `binder_metrics.py` 组装 `target_settings`（`chains` 用生成 PDB 的靶链、`starting_pdb_chains` 用配置的原始靶链）→ 两处链数不一致即抛错
+- 数据取证确认：BindCraft 底层 ColabDesign 的轨迹输出会把**多链靶点合并为一条链**——该同源二聚体（A、B 链序列完全相同、各 116 残基）输出成单链 A（残基编号 1–116 + 167–282，链内编号断裂）+ binder 链 B。归一化产物、`.raw_external` 原始轨迹、MPNN 重设计产物全部如此
+- 因此评估时检测到的靶链只有 `['A']`（合并链），与平台配置的 `['A','B']` 数量不匹配 → 必然崩溃；Genie 3 / PXDesign 输出保持靶链独立（A、B + binder），故不受影响
+
+**代码修复**（`src/proteinfoundation/model_wrappers/result_adapter.py`）
+
+- 新增 `_split_merged_target_chains()`：在归一化写出 `bindcraft_XXXX.pdb` 时，按残基编号断裂点把合并链拆回独立链，链 ID 按文件顺序重编为 A/B/C…（靶点拷贝在前、binder 在后），每链残基从 1 重新编号（与原始靶点编号对齐，兼容 DockQ 残基对齐）
+- 安全护栏：读取 `settings_target.json`（根目录或 `.raw_external/`）的 chains 数做校验，仅当「链内存在编号断裂」且「拆分段数 == 靶链数 + 1（binder）」时才重写，非预期布局原样跳过；天然幂等（已拆分文件无链内断裂，直接返回）
+- 挂载点：`normalize_model_wrapper_outputs` 拷贝循环内，仅对 `backbone_model == "bindcraft"` 生效，其他 wrapper 输出零影响
+- 回归测试：`tests/test_model_wrappers.py` 新增 3 个用例（合并链拆分后的链序/重编号断言、非预期段数跳过、幂等性），模块 24/24 通过。开发中自测发现并修正两个边界 bug：同残基多原子共享残基号导致误分段（放宽为 `resnum not in (last, last+1)` 续段）、已拆分文件被二次重写（引入 `merged` 标志仅在真实链内断裂时触发）
+
+**存量数据修复**
+
+- 对本次卡住任务的 100 个已归一化 `bindcraft_XXXX.pdb` 用同一函数原地修复（generate 步骤的"产物已存在"门禁保持满足，无需重跑生成）
+- 修复后验证（复用评估链路的真实代码路径）：链检测 `[A, B, C]`、binder=C、链 A 序列 == 靶点 A、链 B 序列 == 靶点 B、binder 59 残基；原先抛错的 `starting_pdb_chains` vs `chains` 长度校验通过
+- 评估输出目录的 tmp 副本无需手工清理：`prepare_sample_paths` 在 pdb_dir 模式下每次 evaluate 都无条件重新拷贝，重跑时自动以修复后的 PDB 覆盖
+
+### 结果与产出
+
+- BindCraft 多链靶点 evaluate 崩溃的根因闭环：定位（日志堆栈 → 三个模块链路 → PDB 数据取证）→ 代码修复 → 回归测试 → 存量数据修复 → 修复后验证，全链路完成
+- 卡住任务可直接在界面重试：generate 跳过（归一化产物已在），evaluate 用修复后的 PDB 继续跑 binder 评估，无需重启后端
+- 代码改动覆盖后续所有 BindCraft 多链靶点任务，同一类崩溃不会复发；单链靶点与非 BindCraft 模型行为零变化
+- 测试基线：`tests/test_model_wrappers.py` 24/24 通过
+
+### 遇到的问题及解决
+
+- **现象误导**：报错信息（`starting_pdb_chains` 长度不匹配）指向 evaluate 链校验代码本身，实际根因在上游 BindCraft 输出的链合并。通过对比同靶点 Genie 3（成功，靶链 A/B 独立）与 BindCraft（失败，靶链合并为 A）的 PDB 链结构完成甄别
+- **合并链编号断裂不规则**（116 → 167，非简单接续）：放弃按固定偏移切分，改为按"残基编号连续性"检测段边界，对任意断裂位置均稳健
+- **拆分安全性**：链内残基编号断裂也可能是正常现象，因此用 `settings_target.json` 的靶链数做段数校验（靶链数 + binder），双重条件都满足才重写，非预期布局不碰文件
+
+### 下一步计划
+
+- 在界面重试该 BindCraft 任务，确认 evaluate（ESMFold2 binder 评估 + soluble MPNN 重设计）与后续 analyze、DockQ post-eval 全链路跑通、正常打分
+- 本次代码改动（result_adapter.py + 测试）尚未提交到 ProteinCraft-Agents 仓库，待任务重试验证通过后一并 commit
+- 未来 BindCraft 多链任务要吃到代码修复需重启 bindagent 服务（`sudo bash deploy/restart-bindagent.sh`），选择无活跃任务的窗口执行
+- 可选排查：其他同靶点历史 BindCraft 任务（如 `04546e7a`、`b49f4fcd` 等哈希目录）如也存在卡死的 evaluate，可用同一脚本批量修复
