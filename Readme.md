@@ -794,3 +794,89 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - 本次代码改动（result_adapter.py + 测试）尚未提交到 ProteinCraft-Agents 仓库，待任务重试验证通过后一并 commit
 - 未来 BindCraft 多链任务要吃到代码修复需重启 bindagent 服务（`sudo bash deploy/restart-bindagent.sh`），选择无活跃任务的窗口执行
 - 可选排查：其他同靶点历史 BindCraft 任务（如 `04546e7a`、`b49f4fcd` 等哈希目录）如也存在卡死的 evaluate，可用同一脚本批量修复
+
+
+## 汇报日期 2026-10-25 ~ 2026-10-26：新骨架模型接入（RFD4-Proteina / BindCraft2）+ 全平台模型统一开放接口与 Model Card 体系 + 独立方法工具链（ScanNet 热点等）+ CD8 binder 批量实验
+
+### 工作内容
+
+#### 一、联网调研并部署新骨架模型（RFOptimization 按决策不接入）
+
+- 联网调研 RFD4-Proteina（RosettaCommons）、BindCraft2（PacesaLab）、RFOptimization 三个模型的能力边界、输入输出约定与许可，明确各自适合的实验场景
+- **RFOptimization：按用户决策完全跳过，不做任何接入**（避免增加无收益的依赖与维护面）
+- **RFD4-Proteina**：独立 `.venv` 环境 + 权重下载（走 `hf-mirror.com` 镜像）、RTX 5090 上跑通最小样例；实现 wrapper `src/proteinfoundation/model_wrappers/rfd4_wrapper.py`（PDB→CIF 转换、contig 拼装、`C_CRDGRP`/`C_SEQ`/`C_HOT` conditions 生成、`rfd4-generate` 命令封装、`num_replicates`/`batch_size` 参数化）
+- **BindCraft2**：独立 `.venv`（曾误装进 conda base，已清理并 `pip uninstall -y bindcraft`）；实现 wrapper `src/proteinfoundation/model_wrappers/bindcraft2_wrapper.py`（campaign JSON 生成、binder 长度区间、hotspot 字符串渲染、`max_trajectories` 预算控制、AF2 参数目录共享 `BINDCRAFT_AF2_PARAMS`）
+- 两者均已注册进现有 launch 流水线：`ProteinHarness/launch_config.py`（`ALL_BACKBONES` + 别名表）、`platform/scenes.yaml`（protein_binder 场景允许 + backbone_configs）、`backbone_labels.py`（显示名）、`src/proteinfoundation/model_wrappers/result_adapter.py`（输出转换与候选筛选，RFD4 输出链顺序归一为「靶点链在前、binder 在后」，与评估约定一致）
+- 踩坑记录：RFD4 的 YAML 相对路径按 spec 所在目录解析（初次 smoke 报 `FileNotFoundError /tmp/docs/...`），改在仓库根执行；GitHub 直连下载失败改用 `gh-proxy.com` tarball
+
+#### 二、全平台模型统一开放接口 + Model Card 体系（本次最大规模改造）
+
+- 新增 `ProteinHarness/platform/model_cards.yaml`（594 行，18 张卡）：9 个生成骨架（proteina / bindcraft / bindcraft2 / rfdiffusion3 / pxdesign / genie3 / boltzgen / alphaprotein_novo / rfd4_proteina）+ 9 个独立方法（esmfold2 / esmfold_v1 / af2 / rf3 / proteinmpnn / ligandmpnn / dockq / rosetta_dg / scannet_hotspots）。每张卡统一记录：调用方式（`launch_experiment` / `run_model`）、适用场景、能力、输入/输出格式、可执行任务、best_for / limitations、资源画像（GPU/显存/典型耗时）、运行时探测方式、run_schema（JSON Schema 校验）
+- 新增 `ProteinHarness/model_cards.py`（288 行）：模型 ID 解析与别名归一、可用性探测（builtin / wrapper / env 三种来源）、公开卡片组装（含 `open_api` 描述）、Markdown 渲染（供 agent 阅读）、`validate_run_inputs`（required / anyOf / type / enum 校验）
+- 新增后端统一网关 `Backend/model_runs.py`（781 行）：`POST /api/models/{id}/run`、`GET /api/model-runs/{id}`、`/results`、`GET /api/model-runs`；内存队列 + 落盘 `runtime/model_runs/<run_id>/run.json`（服务重启后可恢复）；GPU 方法（ESMFold2 / AF2 / RF3）由 `_acquire_model_run_gpu` 统一预留 GPU，CPU 方法（ScanNet / Rosetta）不占卡；已接入 9 个方法的真实 runner
+- 新增只读目录 API：`GET /api/models`、`GET /api/models/{model_id}`
+- 新增 4 个 agent 工具（`ProteinHarness/tools/*.yaml` + `executors/`）：`list_models`（返回带 kind/可用状态的模型表）、`read_model_card`（输出卡片并推送 UI 卡片）、`run_model`（校验卡片、参数与可用性后提交运行，**不自动执行**）、`get_model_run`（查状态、指标、表格，完成时推送 3D 结构预览）
+- 前端新增 `Interface/src/components/ModelCard.jsx`、`ModelRunCard.jsx`；`lib/transcript.js` 新增 `MODEL_CARD` / `MODEL_RUN_CARD` op 并纳入 transcript 持久化（刷新后模型卡不丢失）；`AgentChat.jsx` 渲染两类新卡片；中英文文案同步
+- 确认流程：agent 判断场景 → 读卡 → 向用户展示调用方式与预期输出 → 用户确认后才发起 → UI 显示排队位置 / 执行中 / 完成 → 结果指标 + 表格 + 内联 3D 结构可视化
+- 期间修复若干细节：model card YAML 列表项被 YAML 解析成 dict 导致 React 崩溃（加引号 + 新增「列表项必须是字符串」测试 + 组件内 JSON.stringify 守卫）；模型卡 SSE 刷新后丢失（`_apply_op` 改为与 artifact 同款按 identity 持久化）；3D 查看器一直停在 "Loading structure…"（`StructureViewer3D` 需父容器有确定高度，补 `height:280` 包裹）；LigandMPNN 把 native 序列计入结果（按 `overall_confidence` / `sample` 过滤）
+- 文档：`wiki/model-inventory.md` 更新为 18 张卡、开放 API 说明与 ScanNet 备注；`.env` / `.env_example` 补齐 RFD4 / BINDCRAFT2 / BINDCRAFT_AF2_PARAMS / SCANNET 变量
+
+#### 三、独立方法工具链接入（联网调研 ScanNet 并加入 agent 可用工具）
+
+- 联网调研为 minibinder 设计挑选结合位点的专用工具，最终选定 ScanNet（无需 MSA 的界面倾向性预测），并将其封装为平台方法 `scannet_hotspots`，agent 可直接调用
+- 实现细节：调用 `predict_bindingsites.py <pdb>_<chain> --pdb --noMSA`（TF1.14 CPU 环境），解析 annotated PDB 的 CA B-factor 作为界面倾向性分数，转成平台统一的 `A33` 式 hotspot token，输出排序表 + 打分结构
+- 实测：对 CD8 A 链（116 aa）interface 模式约 30 秒完成，推荐 hotspot `A102 / A46 / A97 / A104 / A45 / A106 / A38 / A100`（top score 0.88）
+- 其余独立方法也全部实跑验证：ESMFold2（pLDDT 84.82）、RF3（pTM 0.47）、ESMFold v1（pLDDT 75.86）、AF2（pLDDT 90.36）、ProteinMPNN（4 条序列）、LigandMPNN（3 条序列）、DockQ（1.0）、Rosetta dG（-24.7 REU）
+
+#### 四、Agent 上下文与任务报错修复
+
+- **Agent 误报模型未部署**：历史回复中出现「PXDesign、Genie 3、BoltzGen、AlphaProtein Novo 当前未部署」的错误结论。根因是可用性判断只遍历 `_MODEL_WRAPPER_COMMAND_ENV`（仅含 bindcraft / rfdiffusion3），漏掉 builtin 模型。修复：新增 `_available_generation_backbones()`，以 model card 的 `available` 字段为唯一事实源；`PLATFORM_STATUS` 的 backbones 块改为实时列表，并显式声明「该列表优先于本对话更早消息，旧回复说未部署请据此纠正」。实测新会话正确列出 9 个骨架且四模型均为 available
+- **RFD4 报错 `Preserved segment 'B1-116' matched no atoms`**（任务 be055efb）：请求 `custom_target_input = A1-116,B1-116` 但目标 PDB 只有 A 链，contig 解析必然失败。三层修复：
+  1. `wrapper_base.py` 新增 `pdb_chain_residue_ranges` / `normalize_target_input_for_pdb`：按真实 PDB 链/残基范围丢弃不存在的链、裁剪越界区间，全无效时抛可读错误
+  2. `rfd4_wrapper.py` / `bindcraft2_wrapper.py` 在生成 contig / campaign 前接入归一化，warning 打 stderr
+  3. `Backend/main.py`：`_ensure_custom_target_resolved` 对请求归一化（使 generate 与 evaluate 使用同一 target）；`_requeue_task` 归一化并持久化请求，同时清理旧 `eval_*/.internal/run_progress.json`，否则 evaluate 会因 `config_fingerprint mismatch` 拒绝恢复
+- 修复后 be055efb 重跑跑通 generate → evaluate → analyze，`target_input` 归一为 `A1-116`，DockQ 0.632（self）/ 0.699（MPNN），mapping `AB:AB` 不再崩溃
+
+#### 五、CD8 靶点 binder 批量实验（4 个并发任务 + 新工具联调）
+
+- 目标：`08397de8_CD8_aa22_137`（A 链 116 aa），binder 长度区间 20–80，每个任务 100 designs，nsteps 400，hotspot 自动选择
+- 发起 4 个任务覆盖 4 个骨架（`MAX_CONCURRENT_TASKS=3` + 3 卡自动排队）：`59b99793` Proteina（GPU 0）、`1241d875` RFD4-Proteina（GPU 1）、`8b2d25c9` BindCraft2（GPU 2）、`fc9c7f91` BindCraft v1（排队）
+- 结果（截至汇报时）：Proteina 已完成，100 designs，DockQ max 0.799 / mean 0.160；BindCraft2 已完成，15 个设计入评估，DockQ max 0.921 / mean 0.740（Top5 均为 self 序列，0.905~0.921），并额外产出 15 条 MPNN 重设计序列；RFD4 与 BindCraft v1 分别处于 evaluate / generate 阶段
+- 新模型初步验证：RFD4 输出链组成为「靶点 A: 116 aa + binder B: 62 aa」，binder 长度落在 20–80 区间、链序符合评估约定；BindCraft2 已产出多条 trajectory（`design_l43/48/62/66`），JAX + AF2 流程正常
+- 同时实跑 ScanNet 热点预测（run `mr_d7f1123807`）验证新工具可用，为后续「ScanNet 选点 → 定向设计」链路做准备
+
+### 结果与产出
+
+- **模型资产**：新增 2 个可跑通的生成骨架（RFD4-Proteina、BindCraft2），并接入既有 launch 流水线；RFOptimization 按决策不接入
+- **平台能力**：从「模型只能被 agent launch 实验间接使用」升级为「每个模型都有公开接口 + model card」，共 18 张卡（9 生成 + 9 独立方法），后端 6 个新 API，agent 侧 4 个新工具，调用前需用户确认，确认后展示排队/执行状态并可视化结果
+- **独立方法工具链**：9 个方法（ESMFold2 / ESMFold v1 / AF2 / RF3 / ProteinMPNN / LigandMPNN / DockQ / Rosetta dG / ScanNet 热点）全部实跑通过并接入 agent 可用工具集
+- **代码规模**：新增 12 个文件共约 2930 行（`Backend/model_runs.py` 781 行、`model_cards.yaml` 594 行、`model_cards.py` 288 行、`ModelRunCard.jsx` 262 行、`rfd4_wrapper.py` 182 行、4 个新测试文件等），修改 23 个文件（+888 / -2339 行，删除量主要来自前端静态产物哈希文件替换）
+- **测试**：与本次改造直接相关的测试 56 项全通过（`tests/test_new_model_wrappers.py`、`tests/test_model_wrappers.py`、`ProteinHarness/test_model_cards.py`、`Backend/test_model_runs.py`、`Backend/test_dockq.py`）；全量回归 482 passed / 19 failed，失败项全部落在与本次无关的既有模块（`tools/pubmed_retrieval` keyword_boost 3 项、`ProteinHarness/test_generate_report_pdf_consent.py` 4 项、`tests/test_esmfold2_adapter.py` 2 项 CIF→PDB 环境问题）。已用 `git stash` 在改动前的干净工作区复跑 `tests/test_esmfold2_adapter.py` 复现同样的 2 项失败，确认非本次引入
+- **业务影响**：既有 launch / evaluate / analyze 链路零改动（生成模型仍走 launch pipeline），新增能力以并列通道方式接入
+- **实验产出**：CD8 靶点 4 个骨架并行实验已跑出可用结果（Proteina 100 designs、BindCraft2 15 designs + 15 条 MPNN 序列），DockQ 最高 0.921
+- **服务状态**：`bindagent.service` active，`/api/models` 返回 18 张卡
+
+### 遇到的问题及解决
+
+- **RFD4 首次 smoke 报 `FileNotFoundError /tmp/docs/...`**：YAML 相对路径按 spec 文件所在目录解析，把 spec 改写到仓库根目录后正常
+- **RFD4 输出 binder 链序不稳定**（单链靶点时 binder 排在前）：`_convert_rfd4_outputs` 用「靶点输入链差集」识别 binder 链并移到末尾，已用真实输出验证
+- **BindCraft2 误装进 conda base**：新建独立 `.venv` 重装，并从 base 环境 `pip uninstall -y bindcraft` 清理
+- **GitHub 直连下载失败 / 流中断**：改用 `gh-proxy.com`、`ghproxy.net` tarball；HF 权重走 `hf-mirror.com`
+- **model card YAML 列表项被解析成 dict**（`platform metrics: ...`、`future: ...`）导致 React 渲染报错：列表项统一加引号，并新增「所有列表项必须是字符串」的测试与组件内守卫
+- **模型卡刷新后消失**：SSE 事件未持久化；`_apply_op` 将 `MODEL_CARD` 与 artifact 同款处理，实测刷新后仍在
+- **3D 结构查看器一直 "Loading structure…"**：`StructureViewer3D` 依赖父容器确定高度，补 `height:280` 包裹后 canvas 正常渲染
+- **LigandMPNN 把 native 序列算进结果**：按 `overall_confidence` / `sample` 过滤后重测得 3 条
+- **RF3 报 `InterpolationKeyError RF3_DIR/COMMUNITY_MODELS_PATH`**：`.env` 中 `${VAR}` 链式引用未展开；实现 `_expand_env_value` 递归展开，AF2 / ESMFold 的 `AF2_DIR` / `CACHE_DIR` / `ESMFOLD_DIR` 同理修复
+- **RF3 只输出 CIF 而 `/api/pdb` 仅支持 PDB**：新增 `_cif_to_pdb` 转换 `seed-*` 预测结构
+- **Agent 误报模型未部署**：见上文第四节，可用性判断改为以 model card 为唯一事实源
+- **RFD4 `Preserved segment ... matched no atoms`**：见上文第四节，三层修复（wrapper 归一化 + 请求归一化 + 恢复任务时清理指纹缓存）
+- **模型安装时 conda 环境污染**：全部新模型使用独立 `.venv`，与平台主环境隔离
+
+### 下一步计划
+
+- 跟踪 4 个 CD8 任务的完整 evaluate / analyze 收尾，整理 Proteina / RFD4 / BindCraft2 / BindCraft v1 的横向对比（通过率、DockQ 分布、MPNN 重设计收益）
+- 用 ScanNet 输出的 hotspot 发起一轮 `binding_site_mode=user` 定向设计（如 BindCraft2 或 RFD4），打通「ScanNet 选点 → hotspot → 定向 binder 设计」完整链路
+- ProteinCraft-Agents 仓库当前有 42 个改动/新增文件（含上述全部改造）尚未提交，待实验验证通过后统一 commit
+- 清理验证阶段的临时运行数据与调试账号名下产物，避免污染统计口径
+- 旧历史会话中关于「PXDesign / Genie 3 / BoltzGen / AlphaProtein Novo 未部署」的过期表述，可在需要时批量纠正或标注
+- 关注 `tools/pubmed_retrieval` 与 `ProteinHarness/test_generate_report_pdf_consent.py` 中 7 项与本次无关的既有失败（事件循环 / keyword_boost），安排单独修复窗口
