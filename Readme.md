@@ -880,3 +880,72 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - 清理验证阶段的临时运行数据与调试账号名下产物，避免污染统计口径
 - 旧历史会话中关于「PXDesign / Genie 3 / BoltzGen / AlphaProtein Novo 未部署」的过期表述，可在需要时批量纠正或标注
 - 关注 `tools/pubmed_retrieval` 与 `ProteinHarness/test_generate_report_pdf_consent.py` 中 7 项与本次无关的既有失败（事件循环 / keyword_boost），安排单独修复窗口
+
+## 汇报日期 2026-10-27：平台前端「高定 UI」全面升级（设计向导重构 + 聊天气泡/工具行视觉重构 + ScanNet 参数报错修复）
+
+### 工作内容
+
+- **前端设计体系落地（10 条高定 UI 规则，`Interface/src/index.css`，683 行 / +346 -17）**
+  - 禁黑框与 `#000`，改为 1–3% 微明度 4 层背景分层（`--surface` / `--surface-2` / `--surface-3`）
+  - 输入框聚焦取消描边，改为加深双环阴影；暗色字重全降 40
+  - 流式打字 `blur(6px)` 渐显，120ms 且字间错开 30ms
+  - 图标下移 `0.125em` 对齐；数字锁 `tabular-nums` 防抖；正文开 `text-wrap: pretty`
+  - 折叠统一用 Grid `0fr → 1fr`；拖拽弹簧 1200/80 零回弹、点赞 380/18 微弹；复制对勾 2.5s 自隐
+  - 全部动效补 `prefers-reduced-motion` 降级
+
+- **设计向导重构为 5 步流程（`Interface/src/pages/DesignWizard.jsx`，1602 行 / +751 -457）**
+  - 流程改为「场景 → 靶标 → 模型选择 → 模型参数配置 → 审核」，解决"不同模型参数不同、应先选模型再配参数"的诉求
+  - 模型步骤按当前场景实时拉取 `/api/models?scene=`，只展示该场景下真实可用的模型 list
+  - 初始状态取消默认预选（原先自动回退选中 Proteina-Complexa），切场景时清空已选骨架
+
+- **新增 3D 骨架轮换卡片（`Interface/src/components/BackboneCarousel.jsx`，新增 551 行）**
+  - CSS 3D coverflow 轮换特效（`perspective: 1280px` + `rotateY/scale/translate3d`），未引入 three.js，避免约 600KB bundle 增量
+  - 点击卡片区域任意位置即可左右滑动（按指针相对中心卡判定方向），← / → 键盘全局可用
+  - 拖拽弹簧 1200/80 零回弹；选中徽章 380/18 微弹
+
+- **新增按模型动态参数配置（`Interface/src/lib/backboneParams.js`，新增 135 行 + 46 行单测）**
+  - Proteina（NSTEPS / TTO / Fold guidance）、PXDesign（Sampling preset / Precision）、Genie 3（Guidance scale / Internal refolds）、BoltzGen / BindCraft / BindCraft2（轨迹数与设计数）等各自专属参数
+  - `0 = Auto` 的默认值不下发给后端，随 launch 一并提交 `backbone_params`
+
+- **聊天区三轮视觉重构（`Interface/src/components/AgentChat.jsx`，3599 行 / +284 -144）**
+  - tool card 去卡片化：简化为带 motion 动画的工具行（运行中扫描动效），适配后续更频繁的工具调用
+  - 建立「图标轨道 + 连接线」信息架构：所有 assistant / tool / 各类卡片行共用 28px 左轨，图标统一浅色底 `span`
+  - 为 Literature subagent（BookMarked）、Launch（Rocket）、结构预览（Dna）、Model Card（Sparkles）、Model Run（Cog）、Artifact（Package）分别设计专属浅色底图标，确保左侧细线连接不被卡片阻断
+  - 连接线改为分段式、两端各留 5px 间距，且只在下一条仍是轨道项时才渲染；线与下一个图标一起入场（`rail-grow` / `rail-icon-in`），末尾不再出现"只有线没有图标"
+  - 卡片展开动效 `ChatCardReveal`：Grid `0fr → 1fr` + blur / scale，460ms
+  - 气泡修正：上下 padding 对称（10px 16px）使文字真正居中、圆角统一为 14px（用户气泡左下 4px 与整体一致）
+  - 复制按钮改为绝对定位到气泡右侧、hover 才显形，避免撑宽气泡；移除红色 `Failed` 警示与绿色 done 圆点，统一中性 `done`，报错交由 Agent 自修复
+  - 内部文件路径不再暴露，仅显示文件名
+
+- **其余 Agent 界面同步统一（`BioAgentChat.jsx` / `HtsAgentChat.jsx` / `LiteratureDispatchCard.jsx`）**：轨道样式、浅色底机器人图标、tool 行状态统一
+
+- **Landing 页模型 ticker 更新（`Interface/src/pages/LandingPage.jsx`）**：Proteina-Complexa 去掉 flow-matching 标注、Rosetta 统一为 FreeRosetta、补齐 ScanNet / ESMFold2 / DockQ / MMseqs2 等共 16 项，滚动周期 62s → 96s
+
+- **ScanNet 运行参数报错修复（后端）**
+  - 新增 `coerce_run_inputs()`（`ProteinHarness/model_cards.py`）：按 model card 的 `run_schema` 类型把 LLM 传来的字符串标量归一化（`"8"` → `8`）
+  - Agent 侧 `ProteinHarness/executors/model_runs.py` 与 REST 侧 `Backend/main.py` 的 `POST /api/models/{id}/run` 双路径均改为「先归一化、再校验」，彻底消除该类参数类型报错
+
+### 结果与产出
+
+- **零业务逻辑改动**：本轮全部改动集中在前端表现层与参数类型归一化，既有 launch / evaluate / analyze 链路零改动
+- **测试**：前端单元测试 46 项全通过（`npm run test:unit`）；后端 `ProteinHarness/test_model_cards.py` 14 项全通过（含新增的字符串数值归一化用例与 ScanNet 执行器类型化用例）
+- **真实渲染验证**：用 Playwright + mock API 驱动真实 React 渲染做几何测量，而非截图猜测。实测 10 个轨道图标、5 张卡片、末项 `has-next=false` 且 `::after` 为 `none`、工具图标与文字中心 Y 完全一致（359.25 / 359.25）、气泡 `padding 10px 16px` / 圆角 14px、复制按钮默认 `opacity 0`、卡片展开过渡 `0.46s`
+- **构建与部署**：产物已同步 `Backend/static/`（`index-CMmdn-IC.js` / `index-5bcmR2SF.css`），`bindagent.service` 处于 active，`/api/models` 正常返回 18 张模型卡
+- **代码规模**：已跟踪文件修改 46 个（+2650 / -3193，删除量主要为前端静态产物哈希文件替换），新增未跟踪文件 22 个；其中前端净 +1854 / -855，新增 `BackboneCarousel.jsx` / `backboneParams.js` / `backboneParams.test.js` 共 732 行
+
+### 遇到的问题及解决
+
+- **ScanNet `top_n` 报类型错误**：LLM 传入字符串 `"8"`，`validate_run_inputs` 在进入执行器前直接拒绝。新增 `coerce_run_inputs()` 并在 Agent 与 REST 两条路径上先归一化后校验，问题根治而非单点绕过
+- **新增 ScanNet 用例首次失败**：测试意外调用了真实 ScanNet 运行时，加 `monkeypatch.setenv("SCANNET_PYTHON", "/usr/bin/python3")` 隔离后通过
+- **卡片没有被真正包进轨道容器**：上一版源码中仍是原始 `<div>`，卡片左边缘未对齐气泡。通过 grep 定位后改用 `assert s.count(old) == 1` 精确替换修复，mock 渲染由 4 卡片变 5 卡片、轨道图标 9 → 10
+- **mock 页面渲染空白**：localStorage 键名写错（应为 `pcba:v1:<email>:agent_currentSession`），会话未加载；修正后正常
+- **几何测量结论失真**：测量脚本取到了全局首个 `.tool-orbit` 而非目标行图标，改为按父级相邻节点定位后图标与文字中心 Y 才对齐
+- **后端修复无法生效**：当前环境无免密 sudo（`sudo -n -l` 确认），无法重启 `bindagent.service`；已提供 `deploy/restart-bindagent.sh` 供手动执行（本次服务已于 16:57 重启，ScanNet 修复现已上线）
+- **用户反馈"改了没生效"**：主平台与 8001 端口的 nanobody 独立分支是两套 bundle，互不同步；已同步说明需硬刷新并确认访问的是主平台
+
+### 下一步计划
+
+- 硬刷新后完成本轮五项视觉验收（文献子 agent 图标左对齐、机器人浅色底、Launch 图标、卡片展开动效、连接线两端留白与末尾无尾线）
+- 用线上 ScanNet 跑一轮热点预测做端到端回归，确认 `top_n` 等参数不再报错
+- 将 8001 端口的 nanobody 分支同步本次 UI 改造，避免两条线表现割裂
+- 平台前端改造与后端 Model Card 体系改动共 68 个文件尚未提交，待本轮视觉验收与实验回归通过后统一 commit
