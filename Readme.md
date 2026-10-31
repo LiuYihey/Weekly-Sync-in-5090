@@ -949,3 +949,73 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - 用线上 ScanNet 跑一轮热点预测做端到端回归，确认 `top_n` 等参数不再报错
 - 将 8001 端口的 nanobody 分支同步本次 UI 改造，避免两条线表现割裂
 - 平台前端改造与后端 Model Card 体系改动共 68 个文件尚未提交，待本轮视觉验收与实验回归通过后统一 commit
+
+## 汇报日期 2026-10-31 ~ 2026-11-01：实验流水线三类崩溃修复 + 平台前端高定 UI 二轮（Landing/TopNav/实验列表重构 + 液态玻璃）+ 实验横向对比 skill + Memory skill 根因修复 + 任务实时进度与 ETA 工具化
+
+### 工作内容
+
+- **实验流水线三类崩溃修复（根因级，非绕过）**
+  - RFD4-Proteina 离线模式环境变量污染（`Backend/main.py`）：PubMed 检索器构造时会强设 `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` / `HF_HUB_CACHE`，而模型 wrapper 子进程继承该进程环境，导致 RFD4 加载自身权重时报 `OfflineModeIsEnabled`。改为把这些 HF 环境变量限定在检索器构造期间生效，构造结束即恢复原值
+  - BindCraft2 cuDNN 图捕获崩溃（`src/proteinfoundation/model_wrappers/bindcraft2_wrapper.py`）：在 RTX 5090 / CUDA 13 / cuDNN 9 栈上 cuDNN 注意力后端会触发图捕获崩溃。默认改走 BindCraft2 自带的 `chunked` 内存友好路径（可用 `BINDCRAFT2_ATTENTION_BACKEND` 覆盖），并写入注释说明根因与回退依据
+  - DockQ 表生成中断（`Backend/main.py`）：单个 design 重折叠 OOM 会让整张 DockQ 表中断。改为跳过无重折叠结构的 design 并计数，仅在完全没有有效行时才报错
+
+- **平台前端高定 UI 二轮：Landing / 应用内 TopNav / 实验列表三处重构（`Interface/src/pages/LandingPage.jsx` +97-119、`components/TopNav.jsx` +92-73、`pages/TaskList.jsx` +489-98、`index.css` +64、`components/ui/GlassSurface.css`）**
+  - 落地页 header 改为液态玻璃 banner（`.glass-banner`）：渐变玻璃 + 高光边缘 + 色散侧边 + 流动 sheen，滚动后切换到 `.glass-banner--scrolled` 加深态
+  - 根容器 `overflow-x: hidden` 会让 `position: sticky` 失效，改为 `overflow-x: clip` 修复吸顶
+  - 应用内 TopNav 统一为裸分段导航（active 项白卡抬升），去掉下划线 Tab 与外层玻璃胶囊；Landing 与 TopNav 两处 nav 的最外层椭圆及其阴影按要求移除
+  - CTA / 按钮层统一玻璃材质：`displace 0.3→0.45`、`distortionScale -180→-190`、新增 8s 循环 `glass-sheen` 镜面扫光
+  - 新增 `components/LanguageToggle.jsx`：滑动白玻璃拨杆式语言切换，替换原「显示另一种语言」单按钮
+  - 实验列表重排信息层级、移除重复内容、状态色统一
+
+- **实验横向对比能力（内置 skill）**
+  - 新增 `ProteinHarness/agents/design/WIKI_cross_analysis.md`（69 行）：定义「每个 task_id 必须单独调 `get_task_info`」「只比较同 scene 同 target」「参数不一致标记为 confounded 而非模型排名」等硬性规则，以及 7 个对比维度（Setup / 单体质量 / 群体质量 / 界面证据 / 可设计性 / 多样性 / 成本与可靠性）与固定输出结构
+  - 实验列表新增多选模式：仅 `completed` / `failed` 可勾选，选中高亮 + 底部浮动操作栏，「Compare」自动新建对话并发送结构化对比 prompt（`buildComparisonPrompt`，中英双语）
+  - `ProteinHarness/registry.py` 与 `tools/read_wiki.yaml` 的 `read_wiki` 文档枚举补入 `WIKI_analysis`、`WIKI_cross_analysis`
+  - `CORE.md` 新增「Cross-experiment comparison — MANDATORY `read_wiki`」段落，并改写模型选择流程：模型选择前置到 Launch 卡片出现之前，Launch 卡片改为纯确认、移除卡内模型切换控件
+
+- **Memory skill 根因修复与策略改写**
+  - 根因定位：JSON 解析器仅接受整段合法对象、解析失败后无重试、token 上限不足、错误被当作「已处理」标记，导致实验结束后记忆长期不更新。修复解析逻辑、加入失败重试与启动时 `_backfill_pending_memory_updates()` 补偿扫描
+  - 记忆策略改写（`Backend/memory_analysis.py`）：只保留「会改变下一次配置决策」的可复用设计先验；明确禁止写入 bug / 崩溃 / OOM / 缺文件 / HF 离线配置错误 / wrapper 不兼容 / 调试记录 / 待办 / run ID / 日期等基础设施类信息，证据不足时正确答案是 noop
+  - 触发时机改为实验结果 auto interpretation 完成后执行，并在会话中追加 `memory_update` 消息
+  - 新增 `components/MemoryUpdateCard.jsx`（99 行）：聊天内显式反馈记忆是「已更新 / 无更新 / 更新失败」，并显示版本号与增删改条数
+
+- **任务进度与 ETA 工具化（`get_task_info` 扩展）**
+  - `Backend/main.py` 新增 `_task_progress_snapshot()`，返回 `stage` / `n_samples_requested` / `generated_count` / `evaluated_count` / `fraction` / `percent` / `elapsed_seconds` / `queue_position` / `gpu_id` / `estimated_completion_at` / `eta_note` 11 个字段，并挂到 `_build_task_info_for_tool` 的 `progress` 段
+  - 阶段感知进度模型：generate 阶段占前 50%、evaluate 占后 50%；评估分母取实际生成数（BindCraft 曾以 n_samples=100 产出 369 个候选，固定分母会算错）
+  - ETA 外推 `created + elapsed / min(fraction, 0.98)`，门槛为运行 5 分钟且进度 ≥12%，上限 7 天；后端与前端共用同一公式
+  - `registry.py` 的工具描述改写为「进度、ETA、结果类问题必须调用本工具，绝不猜测数字」
+  - `CORE.md` 新增「Progress & ETA — MANDATORY `get_task_info`」段：9 个字段含义表 + 4 条回答纪律（引用实时数字、无估计时按 `eta_note` 解释且不得编时间、UTC 转用户时区并保留「预计」措辞、两次调用 percent 未变则提示可能停滞）
+
+- **本轮界面精简与启动跳转修正**
+  - 设计向导删除「QUALITY THRESHOLDS」卡片（阈值由后端固定、不可调、用户无需感知），并同步清理 `tto_metrics_*` 相关文案
+  - 设计向导删除「Use project memory for this task」卡片与 `memory_enabled` 下发字段：记忆整理已由固定 Memory Agent 承担，是否启用改由 chat 内按钮控制
+  - 实验列表删除「Launched N experiment(s). Track their status below…」banner
+  - manual config launch 后的跳转按反馈修正为：停留在 EXPERIMENT HISTORY，左侧为任务列表、右侧侧栏直接绑定 linked chat 会话（`App.jsx` 新增 `launchSessionId`，`AgentChat.jsx` 新增无 `detailTaskId` 时的直绑路径）
+
+### 结果与产出
+
+- **代码规模**：本轮全部改动收敛到单次提交 `049d782 UI-improve`（30 文件，+1988 / -678），其中源码改动 25 文件 +1833 / -546；改动分布在 `Backend/main.py`(+463-56)、`TaskList.jsx`(+489-98)、`AgentChat.jsx`(+113-51)、`TopNav.jsx`(+92-73)、`LandingPage.jsx`(+97-119)、`CORE.md`(+48-6)，新增 `WIKI_cross_analysis.md` / `LanguageToggle.jsx` / `MemoryUpdateCard.jsx` 三个文件
+- **测试基线**：ProteinHarness 230 passed；Backend 189 passed / 4 failed（4 项失败均为历史文档断言类：断言 CORE.md 含 `[SYSTEM_AUTO]`、断言 TaskList 存在 `motionIndex={index}` 字面量、rfdiffusion3 `inputs.yaml` 键名引号差异、target 解析 A1-114 与 A1-266 不一致，与本轮功能无关）；前端 `npm run test:unit` 46 passed
+- **真实渲染验证（Playwright + mock API）**：Review 页确认 `qualityCard=false`、`memoryCard=false`；点击 Launch 后页面标题为「Tasks」、顶部导航存在、无 Back 按钮、右侧可见 aside 宽 448px 且内容为「AI Design Agent / Memory · ON / History」，确认「左任务列表 + 右 linked chat」布局成立
+- **部署状态**：产物已同步 `Backend/static/`（`index-Bk8qcSDt.js` / `index-CR4q6999.css`），nginx 80 端口对外提供；`bindagent.service` 处于 active（Main PID 3451261），3 个运行中实验的 task_runner worker 未受重启影响
+- **端到端数据校验**：运行中任务 `get_task_info` 实测返回 `stage=evaluate / n_samples=100 / generated=100 / evaluated=2 / fraction=0.51 / percent=51.0 / elapsed=3349s / gpu_id=2 / estimated_completion_at=2026-10-31T17:42:24Z`，与前端展示口径一致
+
+### 遇到的问题及解决
+
+- **Memory skill 静默不更新**：解析器只接受整段合法 JSON 且失败后直接标记「已处理」、永不重试，实验跑完记忆也不更新。改为容错解析 + 失败重试 + 启动 backfill 三层兜底，并补上聊天内显式反馈卡，让「没更新」和「更新失败」对用户可见
+- **进度条超过 100% 与分母固定 200**：旧公式假设生成数与评估数都等于 `n_samples`，而 wrapper 型 backbone 会超产候选（BindCraft 100 → 369）。改为按当前阶段取分母并把生成/评估拆成前后两段
+- **靶标代号显示不一致**：旧的 run_name 截断用 `lastIndexOf('_proteina_')` 会命中字符串内部子串，改为从末尾匹配并由后端补 `target_label` 字段，前端保留解析兜底
+- **sticky 吸顶失效**：根容器 `overflow-x: hidden` 与 `position: sticky` 冲突，改为 `overflow-x: clip`
+- **f-string 语法错误**：写进度快照时在 Python f-string 里误用 JS 的 `||`，触发 `SyntaxError: f-string: expecting '='`，改为 Python 的 `or`
+- **Playwright 启动失败**：`libatspi.so.0: undefined symbol: g_once_init_leave_pointer`，根因是 shell 继承了 trae-cn-server 的 `LD_LIBRARY_PATH`，运行 node / python 时加 `env -u LD_LIBRARY_PATH` 隔离
+- **端到端脚本走不通向导**：实际按钮文案是「Choose model / Set up parameters / Review」而非「Continue」，模型项是 `[role=option]` 而非 button，隐藏 file input 与上传框并存导致上传 mock 未命中 —— 逐项按真实 DOM 修正后通过
+- **验证断言误判**：`document.querySelector('aside')` 取到隐藏的 Memory 页 aside（宽 0），改为遍历所有 aside 并按可见性过滤
+- **导航方向被用户纠正**：首版把 manual launch 导航到 task detail 内部界面，与期望不符，按反馈撤回 detail 跳转，改为停留列表页并把会话直绑到右侧栏
+
+### 下一步计划
+
+- 清理 i18n 词表中已无 UI 引用的 `tto_metrics_*` / `memory_launch_*` / `tasklist_launched_*` 键
+- 修复 Backend 4 项历史文档断言型失败测试（断言依赖 CORE.md 字面量与源码字面量，改为语义化断言）
+- 用真实线上实验跑一轮横向对比回归：验证多选 → Agent 逐个 `get_task_info` → `run_analysis_code` 出对比图 → 固定结构对比结论的完整链路
+- 观察 ETA 外推在长时运行任务上的偏差，必要时引入阶段切换速率修正
+- 将 8001 端口的 nanobody 独立分支同步本轮 UI 与导航改造，避免两条线表现割裂
