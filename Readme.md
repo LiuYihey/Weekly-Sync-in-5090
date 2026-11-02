@@ -1019,3 +1019,127 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - 用真实线上实验跑一轮横向对比回归：验证多选 → Agent 逐个 `get_task_info` → `run_analysis_code` 出对比图 → 固定结构对比结论的完整链路
 - 观察 ETA 外推在长时运行任务上的偏差，必要时引入阶段切换速率修正
 - 将 8001 端口的 nanobody 独立分支同步本轮 UI 与导航改造，避免两条线表现割裂
+## 汇报日期 2026-11-01 ~ 2026-11-03：Agent 上下文压缩 + 记忆系统 Skill 化重构（Memory restored / updated 双卡）+ 评测 N/A 与 RFD4/DockQ 三类流水线修复 + 聊天侧栏溢出根治 + 靶点筛选可扩展重设计
+
+### 工作内容
+
+- **Agent 上下文压缩（context compaction）落地（`ProteinHarness/context_compaction.py` 423 行 + `ProteinHarness/agent_loop.py` +257）**
+  - 设计目标：harness 的工具循环没有轮次上限，长任务会撑爆模型上下文窗口。方案是只重写模型看到的 `llm_messages`，用户看到的 UI transcript 与侧栏状态（plan_steps、launch facts、linked task ids）保持逐字不变
+  - 关键安全约束：摘要切分点必须落在真实 user turn，或 assistant `tool_use` 紧跟 `tool_result` 的成对边界上，绝不在工具调用对中间切断；保留一段原样尾部（verbatim tail），agent 不会丢失当前正在进行的这一轮
+  - 分层降级：prompt 超过窗口 60% 时先把超长工具输出裁剪到 4000 字符，超过 90% 才做整体摘要（`resolve_compaction_settings` / `prune_tool_results` / `select_compaction_split` / `build_summary_prompt` / `apply_compaction`）
+  - provider 溢出重试：识别 `context_length_exceeded` / `prompt is too long` 等 11 种「请求过大」措辞，最多重试 2 次；判定刻意收窄，通用 400（工具 schema 错、参数错）绝不触发压缩
+  - 摘要以单条 `[CONTEXT SUMMARY]` user 消息注入，后续轮次可识别并二次摘要
+  - 配置落在 `Backend/agent_config.json`：`context_window_tokens=200000`、`trigger_ratio=0.9`、`reserve_tokens=8192`、`keep_recent_turns=1`、`summary_max_tokens=4096`、`overflow_retry=2`
+  - 前端把压缩过程渲染成与其它工具一致的侧栏活动行（`tool_compact_context`：Compressing context / 压缩上下文），用户能感知但不会看到原始摘要
+
+- **框架选型技术文档（`NOTES/LangChain_vs_ProteinHarness.md` 195 行）**
+  - 结论：LangChain 解决的是「零件」，会拿走「决策权」，而平台的差异恰恰长在决策权上
+  - 佐证：DeepSeek Harness 源码中 langchain / langgraph / llamaindex / crewai / autogen 出现次数均为 0，它自己实现了 packages/llm、packages/compaction、packages/guard、packages/plan
+  - 用三概念表区分 LangChain（组件库）/ LangGraph（状态图运行时）/ Harness（端到端交付），并给出「若一开始就用 LangChain 会长成什么样」的对照分析
+
+- **记忆系统 Skill 化重构（8 项需求整体落地，本轮最大架构改动）**
+  - 删除独立的 memory retrieval / memory update agent：`Backend/main.py` 净减 488 行（+231 / -719），`Backend/memory_analysis.py` 与 `Backend/memory_analysis_skill.md` 中的记忆更新职责被清空（只保留 cohort 学习简报）
+  - 新增 design agent 的记忆 Skill 与 6 个工具（`ProteinHarness/executors/memory.py` 435 行 + `ProteinHarness/tools/*.yaml` 6 个 + `profile.yaml` 注册 + `registry.py` 装配）：
+    - `list_memory_targets` —— 只返回靶点记忆的**索引**（键 + 标题 + 条目数），不含正文
+    - `read_target_memory` —— 命中靶点后才读取该条目的完整 bullets
+    - `restore_memory` —— 产出 Memory restored 卡片，携带 2-3 条 take-away、命中状态与记忆版本号
+    - `update_target_memory` —— 仅在确有可复用的用户级设计知识变化时写入，并回显更新后的完整条目
+    - `list_target_experiments` —— 列出该靶点下的全部实验（task_id / model / status / samples）
+    - `summarize_target_experiments` —— 触发靶点级横向分析简报
+  - 新增 `ProteinHarness/agents/design/WIKI_memory_update.md`（77 行）作为 Skill 说明书，明确硬边界：只写面向普通用户的可复用设计知识（优选骨架、长度区间、热点选择、折叠/界面成败、稳定性取舍），**禁止**写入 bug / OOM / 缺文件 / 评估器口径 / pipeline 错误 / task id / 日期 / 调试记录；发现 bug 就在代码里修，不进记忆
+  - Skill 工作流写死在文档里：先把长解读蒸馏成 2-3 条 take-away → `restore_memory` → `list_memory_targets` + `read_target_memory` 对比既有记忆 → 必要时做靶点级横向分析（`list_target_experiments` / `summarize_target_experiments` / `run_analysis_code`）→ 只有知识真正变化才 `update_target_memory`
+  - 明确取消「No memory update」卡片：没有变化时只保留 Memory restored 卡片，不出现空提示
+  - `CORE.md` 增加「Memory skill — target-scoped, user-facing」段落，与 Skill 文档口径一致
+  - 上下文注入方式：会话启动 / 靶点确认 / 上传时注入的是**靶点记忆索引**（`<PROJECT_MEMORY_INDEX>`），agent 像读工具列表一样先看索引再按需取正文；旧的 `<PROJECT_MEMORY_CONTEXT>` 全文注入已彻底移除
+  - UI 事件协议：新增 `ui:memory_restore_card` / `ui:memory_update_card` 两类事件，在 `_ui_event_to_message` / `_TranscriptOp` / `_TranscriptAccumulator` / `_apply_op` 四处同步落地，保证重启后 transcript 仍可回放
+  - 新增前端卡片 `Interface/src/components/MemoryRestoreCard.jsx`（83 行）；`MemoryUpdateCard.jsx` 改为只有「已更新 / 更新失败」两种状态才渲染，完整展示更新后的条目内容
+  - 数据侧清理：`Backend/user_memory.db` 中 cd8 条目版本 21 → 22，删除两条开发者口径 bullets，保留 5 条面向用户的结论；`runtime/agent_sessions.db` 中历史手动插入的 memory_update 卡片记录一并清除
+
+- **聊天侧栏溢出根治（三轮迭代后收口）**
+  - 根因不在气泡本身，而在 flex 容器的 min-content 展开：长表格 / 长文件名 / inline code 会把气泡撑得比侧栏更宽，父级 `overflow: hidden` 直接把溢出部分裁掉
+  - 布局改造（`Interface/src/components/AgentChat.jsx`）：assistant 消息行与 `ChatRailRow` 从 flex 改为 CSS Grid `28px minmax(0, 1fr)`，消息容器加 `contain: inline-size` + `overflowWrap: anywhere` + `wordBreak: break-word`，气泡宽度改为 `100%` 且 `maxWidth: 100%`
+  - 侧栏宽度可调下限（`Interface/src/App.jsx`）：`SIDEBAR_MIN` 280 → 360，新增 `MAIN_MIN = 480` 与 `clampSidebarWidth()`，保证主区始终有可用宽度；上限按 `window.innerWidth - MAIN_MIN` 动态计算
+  - Markdown 表格改为独立滚动容器（`AssistantMarkdown.jsx`）：外层 `overflowX: auto` + `overscrollBehaviorX: contain`，表格本身 `width: max-content; minWidth: 100%`
+  - Playwright 无头实测：侧栏 456px 时气泡宽 294px、右边缘 359px，完整落在侧栏内
+
+- **Markdown 表格误判修复（`Interface/src/lib/markdownTables.js`）**
+  - 现象：`- 9 designs with |dG| > 1000 ...` 这类散文行被渲染成三列表格
+  - 根因：`isTableLine` 只判断「能否切成 ≥2 个单元格」，导致任何含两个竖线的散文都被当成表格行
+  - 修复：显式排除列表行（`^[-*•·◦]\s`），并要求行首或行尾有外层竖线、或是分隔行、或是多行粘连才认定为表格；`|dG|` 这类数学记号不再误判
+  - 补充 2 条回归测试（散文含 `|dG|` 保持散文、真表格仍被正确修复），前端单测从 46 增至 54
+
+- **评测质量档位 N/A 治理（`Interface/src/pages/TaskDetailReplica.jsx` + `src/proteinfoundation/utils/esmfold2_utils.py` +293 + `command_runner.py`）**
+  - 降显存压力：ESMFold2 每条设计的 MPNN 重折叠数默认 8 → 4（`_eval_redesign_sequence_count`，可用 `EVAL_MPNN_REDESIGN_SEQS` 覆盖），这是评估侧最主要的显存杠杆
+  - 自动重试：新增 OOM 判定（`_is_esmfold2_oom`）与逐级降载重试阶梯（`_esmfold2_retry_attempts`），每次重试用更轻的采样设置在全新子进程中重跑，配渐进冷却；AF2 补充预测失败不再丢弃已成功的 ESMFold2 结果
+  - 兜底评级：self 序列重折叠缺失时，质量档位回退到 MPNN 轨道的 iPTM / iPAE / pLDDT / scRMSD，徽标 title 标注数据来源，不再直接显示 N/A
+  - 分配器配置：ESMFold2 与 RFD4 的 `PYTORCH_CUDA_ALLOC_CONF` 追加 `max_split_size_mb:128`，避免单次超大分配占满整卡
+
+- **RFD4-Proteina CUDA OOM 修复（`src/proteinfoundation/model_wrappers/rfd4_wrapper.py` +77）**
+  - 现场：GPU 0 上另有一个进程占用 15.91 GiB，只剩 1.42 GiB，而 RFD4 单次 batch 16 需要 1.46 GiB，`generate.shell` 阶段 `torch.OutOfMemoryError` 直接失败
+  - 默认 batch 16 → 8，并暴露 `RFD4_BATCH_SIZE` 环境变量（`ProteinHarness/launch_config.py` 同步加 spec），1..n_samples 之间裁剪
+  - 自动降载重试：读取 `hydra_outputs/generate.log` 新增内容，命中 "out of memory" 时按 8 → 4 → 2 → 1 折半重跑，最多 4 次；日志明确写出每次降载原因
+  - 前端参数面板同步新增「生成 batch」步进器（`Interface/src/lib/backboneParams.js` + `LanguageContext.jsx` 中英文案），用户可在 GPU 共享时手动降到 1–4
+
+- **DockQ 靶标-靶标界面误判修复（`Backend/main.py` + `src/proteinfoundation/analyze.py`）**
+  - 现象：多链靶点下 DockQ 只检测到靶点-靶点界面（如 `AB:AB`）时，仍会输出很高的 DockQ，看似 binder 结合得很好，实际 binder 根本没接触靶点
+  - 修复：新增 `_dockq_row_hits_binder()`，只聚合包含 binder 链的界面；DockQ 表新增 `binder_interface` 标记列，聚合阶段按该列过滤，旧表无该列时保持原行为
+  - 配套回归用例：`Backend/test_dockq.py` 新增链对命中判定与 BindCraft2 campaign 汇总两组测试
+
+- **实验列表设计数口径修正（`Interface/src/pages/TaskList.jsx`）**
+  - 现象：列表显示「100 designs」，详情页只看到 10 个
+  - 根因：列表用的是请求值 `n_samples`，实际产出是 `metrics.n_samples`（BindCraft2 可能 0/N 全部落选并回退到 refold 候选）
+  - 修复：新增 `taskDesignsLabel()`，优先取实际产出数，请求值大于实际值时显示「实际 / 请求」并配提示文案；详情页新增 BindCraft2 fallback 警示条（候选数 / 接受数），把「为什么少了」显式告诉用户
+
+- **靶点筛选可扩展重设计（`Interface/src/pages/TaskList.jsx`，替换原横向 chip 行）**
+  - 问题：原本把每个靶点渲染成一个 chip 平铺在页面上，靶点少时还能看，靶点一多（实测已达 127 个）整行撑爆、UI 不可用
+  - 新方案：收敛为单一触发按钮 + 可搜索弹出层。触发按钮显示当前靶点与实验数；弹出层顶部是搜索框（按显示名与原始靶点键匹配），每行显示「靶点名 + 实验数 · 设计样本数」，按最近活跃时间排序，列表最前固定是「全部靶点」并给出全局合计
+  - 规模控制：一次最多渲染 40 条，超出显示「显示 40/127，输入以缩小范围」，靶点再多也不会撑开页面
+  - 交互完备：↑↓ 移动、Enter 选中、Esc 关闭、点击外部关闭、选中项打勾高亮、旁侧「清除」一键回到全部；弹出层宽度 `min(380px, 100vw - 48px)`，窄屏不出界
+  - 焦点环统一由搜索容器绘制（`Interface/src/index.css` 新增 `.target-search-field:focus-within`），消除输入框自带的双重边框
+  - 中英文案补齐：`tasklist_target_search_placeholder` / `tasklist_no_matching_targets` / `tasklist_target_showing` / `tasklist_target_keyboard_hint` / `tasklist_target_clear`
+
+- **Artifacts 卡片非预览文件降级（`Interface/src/components/ArtifactCard.jsx` +77）**
+  - csv / json / xlsx / parquet 无法内联预览，原先渲染成一个空预览窗加自身边框，信息量为零
+  - 改为紧凑文件行：按类型选 FileSpreadsheet / FileText 图标，标题只显示文件名主干（不再重复全名），副行显示「类型 · 大小」，保留下载动作
+
+### 结果与产出
+
+- **代码规模**：本轮 4 次提交，源码改动 44 文件 +3631 / -963（不含前端哈希产物）
+  - `cdb0ed4`（13 文件，+1448 / -12）：上下文压缩 + 框架选型文档
+  - `5b24314`（3 文件，+87 / -31）：Artifacts 非预览文件降级
+  - `85f81ec`（8 文件，+238 / -28）：DockQ 链对过滤 + 设计数口径 + BindCraft2 fallback 提示
+  - `b11a342`（48 文件，+20946 / -964，其中源码 31 文件 +1899 / -906）：记忆系统重构 + 侧栏溢出 + 表格修复 + RFD4/ESMFold2 OOM + 靶点筛选重设计
+  - 新增文件：`ProteinHarness/context_compaction.py`(423) / `ProteinHarness/executors/memory.py`(435) / `WIKI_memory_update.md`(77) / `MemoryRestoreCard.jsx`(83) / `NOTES/LangChain_vs_ProteinHarness.md`(195) / 6 个记忆工具 yaml
+  - 记忆工具合计 6 个（list_memory_targets / read_target_memory / restore_memory / update_target_memory / list_target_experiments / summarize_target_experiments），已全部在 `ProteinHarness/registry.py` 注册并挂到 design agent profile
+- **测试基线**
+  - ProteinHarness：**260 passed**（其中上下文压缩专项 29 项全通过：`test_context_compaction.py` + `test_unbounded_rounds_compaction.py`）
+  - Backend：**192 passed / 4 failed**；4 项失败经逐项定位均非本轮改动引入：两项断言的是早已删除的源码字面量（`motionIndex={index}` 于 2026-07-17 的 `5bccfe2` 已移除；rfdiffusion3 `inputs.yaml` 引号风格差异），一项断言未归一化的靶点区间（A1-266 与 A1-114，与归一化后的实际值不符），一项是第三方依赖问题（`ModuleNotFoundError: loguru`，临时 pytest 解释器缺该包；项目 `.venv` 里有，但它的 `_sqlite3` C 扩展与系统 libsqlite 不匹配，报 `undefined symbol: sqlite3_deserialize`，属环境问题而非代码问题）
+  - 前端 `npm run test:unit`：**54 passed**
+- **真实渲染验证（Playwright + 无头 Chromium，非截图猜测）**
+  - 侧栏溢出：侧栏 456px → 气泡 294px、右边缘 359px，完整落在侧栏内
+  - 靶点筛选：打开弹出层 → 输入 `CD8` 结果收窄到 2 行 → ↑↓ + Enter 选中 → 重开后选中项高亮且带勾 → Esc 关闭 → 「清除」恢复全部；弹出层 378px 宽，1500px 视口内无越界；控制台零报错
+  - 焦点环：搜索容器绘制单一焦点环，输入框自身无二次边框
+- **部署状态**：产物已同步 `Backend/static/`（`index-BayXuthP.js` / `index-BdjwDhWG.css`），与 `Interface/dist/` 的 `index.html` 校验一致；`bindagent.service` active（2026-11-02 23:55:53 重启），`/api/models` 返回 200
+- **记忆库**：cd8 条目版本 21 → 22，保留 5 条面向用户的结论，删除 2 条开发者口径 bullet；「无更新」空提示链路整体下线
+
+### 遇到的问题及解决
+
+- **靶点 chip 行撑爆 UI**：用户直接指出「这种方式只适合现在 target 少的情况，多起来之后 UI 撑不住」，随即改为可搜索弹出层并做规模上限与键盘可达性，而不是简单加一个 max-height 掩盖问题
+- **侧栏溢出三次修复仍复发**：第一次只加 `minWidth: 0` 与表格滚动，用户反馈「完全没有解决，而且愈发严重」；第二次改用 CSS Grid `minmax(0, 1fr)` + `contain: inline-size` 才真正收口——根因是 flex 的 min-content 展开，Grid 的 `minmax(0, 1fr)` 才能强制列可收缩
+- **散文被误渲染成表格**：`|dG|` 这类竖线数学记号被表格规范化逻辑吃掉，根因是判定条件只看「能否切成 ≥2 格」，改为显式排除列表行并要求外层竖线等结构特征
+- **DockQ 看似高分实为靶点自聚**：多链靶点下 DockQ 只报 `AB:AB` 界面且分数很高，用户直观感受「分子相隔很远但 pLDDT 不低」，追到根因是聚合了不含 binder 链的界面；改为只聚合命中 binder 的界面并加 `binder_interface` 标记列
+- **RFD4 OOM 卡死 generate**：定位到 GPU 0 上有外部进程占 15.91 GiB，只剩 1.42 GiB 而 batch 16 需 1.46 GiB；不是简单调小 batch 就完事，同时补上「读日志自动折半重试」，让参数配错也能自愈
+- **评测质量档位大面积 N/A**：根因是 ESMFold2 逐序列重折叠的显存压力；三管齐下——重折叠数 8→4、OOM 逐级降载自动重试、MPNN 轨道的档位兜底
+- **无效 JS 混入源码**：编辑 TaskList 时误插入 `const &$(targetOptions, targetQuery) = ...`，在构建前自查中清除，避免了一次构建失败
+- **后端 4 项失败测试逐项归因**：没有笼统归为「历史问题」，而是分别定位到源码字面量断言、第三方依赖缺失（`loguru`）、靶点区间归一化行为差异三类，确认与本轮功能无因果关系；其中 `loguru` 一项进一步查出项目 `.venv` 的 `_sqlite3` C 扩展与系统 libsqlite 版本不匹配（`undefined symbol: sqlite3_deserialize`），属环境层问题
+- **Playwright 环境干扰**：shell 继承 trae-cn-server 的 `LD_LIBRARY_PATH` 会导致 Chromium 与部分 Python 模块加载异常，统一用 `env -u LD_LIBRARY_PATH` 隔离
+- **token 凭据获取**：本机 JWT 需与后端 `SECRET_KEY` 一致，从项目 `.env` 读取密钥后用 `create_access_token` 现场签发调试令牌，未落盘任何真实凭据
+
+### 下一步计划
+
+- 修复 Backend 4 项失败测试：把源码字面量断言（`motionIndex={index}`、rfdiffusion3 YAML 引号风格）改为语义化断言，靶点区间一项按归一化后的期望值更新，并补齐临时测试解释器的 `loguru` 依赖或统一测试解释器
+- 修复项目 `.venv` 的 `_sqlite3` 与系统 libsqlite 版本不匹配问题，恢复「用项目虚拟环境直接跑测试」的能力
+- 靶点规模进一步增长后，把实验列表页的靶点筛选升级为独立的靶点索引视图：搜索 + 按最近活跃/样本量排序的靶点列表，点进去看该靶点全部实验与汇总指标
+- 用真实线上实验跑一轮记忆 Skill 全链路回归：实验解读 → 2-3 条 take-away → Memory restored 卡片 → 读取既有记忆 → 靶点级横向分析 → 确认知识变化后才出 Memory updated 卡片
+- 恢复 RFD4 失败任务 `4d6c9ded` 的 resume，验证 batch 降载与自动折半重试在真实任务上的效果
+- 观察 ESMFold2 逐级降载重试在长时任务上的收益，必要时把重折叠数做成任务级可调参数
