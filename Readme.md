@@ -1143,3 +1143,69 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - 用真实线上实验跑一轮记忆 Skill 全链路回归：实验解读 → 2-3 条 take-away → Memory restored 卡片 → 读取既有记忆 → 靶点级横向分析 → 确认知识变化后才出 Memory updated 卡片
 - 恢复 RFD4 失败任务 `4d6c9ded` 的 resume，验证 batch 降载与自动折半重试在真实任务上的效果
 - 观察 ESMFold2 逐级降载重试在长时任务上的收益，必要时把重折叠数做成任务级可调参数
+
+## 汇报日期 2026-11-03（续）：记忆链路语义重构 + Meta Tool 迁移（实验数据可查询化与通用文件原语）
+
+### 工作内容
+
+- **记忆链路语义重构（Agent Memory Skill，唯一流程确立）**
+  - 流程收敛为固定五步：实验解读 → **Take away**（2-3 句凝练结论）→ 与该靶点既有记忆逐条比对 → 判定「追加 / 合并 / 编辑 / 不更新」→ 必要时补做靶点级横向分析 → **最后**才产出（可选的）Memory updated 卡片。原链路中 update 可以夹在流程任意位置，现强制 update 是链路末端的唯一可选动作
+  - `restore_memory` 更名 `record_takeaway`（`ProteinHarness/tools/restore_memory.yaml` 删除 → `record_takeaway.yaml`）：原工具名为「恢复记忆」但实现只是展示，属于命名与语义错配；新工具只负责**写入本轮 take-away**，不读记忆、不改记忆，每条 ≤160 字、超限直接报错而不是截断
+  - 单轮只允许一次记忆更新：服务端守卫 `context["_memory_updated"]`，第二次调用直接返回错误，杜绝一个 turn 里反复打补丁的混乱链路
+  - 更新卡只展示**变更项**：`Backend/user_memory.py` 新增 `diff_changes(change_log)`，把每次 patch 归类为 append / merge / edit 并输出 `added / updated / removed / rewrite`，前端 `MemoryUpdateCard.jsx` 只渲染这部分，不再把整份靶点记忆摊给用户看
+  - 协议从「turn 内补读 WIKI」改为服务端内联：`Backend/main.py` 的 `_run_memory_skill_turn` 直接内联中文流程约束，模型不再需要额外拉一次技能文档再动手
+
+- **记忆体系能力补全：scope 隔离 + 脏数据治理 + 全中文**
+  - scope 隔离（干实验 / 湿实验）：`Backend/user_memory.py` 引入 `SCOPES = ("dry", "wet")`，`user_memories` 主键由 `owner_email` 改为 `(owner_email, scope)`，版本历史表同步加 scope 列，表结构走幂等迁移（`ALTER TABLE ... RENAME` → 建新表 → 拷贝 → DROP），干湿两套记忆各存各的、各有各的版本线
+  - 字典格式脏数据根因修复（三层同时收口）：① 写入层 `_normalize_bullet_value` 把 dict 归一化为纯文本；② 读取层 `_unwrap_legacy_dict_text` 兼容解包历史 `{'content': ..., 'key': 'b1'}` 字面量；③ 契约层把 `update_target_memory.yaml` 的 `additionalProperties` 收紧为 `false`、bullets 限定纯字符串数组，让非法形状在工具入参就被拒
+  - 记忆文档全中文：`ProteinHarness/agents/design/WIKI_memory_update.md` 全量重写为中文，明确「只存面向用户的设计知识」的硬边界、唯一流程、更新决策表、take-away 写作规范（2-3 句 / ≤160 字 / ≤1-2 个数字）、一次性更新规则与反例
+  - 存量数据清洗：主账号 cd8 条目 15 条 dict-repr 子弹重写为 8 条中文精炼结论，pdl1 条目 3 条转为中文，版本 v26 → v29，旧版进历史归档
+
+- **Meta Tool 迁移：把实验做成可查询的数据，而不是为每个需求加工具**
+  - 设计原则（对齐 file MCP 思路）：工具层只提供「看 / 查 / 算 / 写」四类正交原语，领域知识全部沉淀在**数据布局 + 配方 WIKI + 确定性库**三处；今后出现新需求，agent 用现有原语组合即可完成，不需要新加工具
+  - 新增 `Backend/experiment_catalog.py`（612 行）：每用户一份独立 SQLite catalog，含 `runs` / `designs` / `catalog_meta` 三表；构建时原子替换文件，按 `source_max_mtime` 做懒刷新；提供只读 SQL 入口 `query()`，仅允许 SELECT / WITH 单语句，并对 `attach / detach / pragma / insert / update / delete / create / drop / alter / replace / vacuum / reindex / load_extension` 等关键字做黑名单拦截
+  - 新增 4 个通用工具（`ProteinHarness/tools/`）：`query_table`（跨实验检索聚合）、`glob_files`（路径通配）、`get_file_info`（文件元信息）、`grep_files`（正则全文检索，带 glob 过滤与上下文行），配套 `ProteinHarness/executors/meta_query.py`（SQL → markdown/JSON 渲染）与 `sandbox_tools.py` 扩展
+  - 新增沙箱内可导入的确定性库 `Backend/sandbox/proteincraft_lab.py`（294 行）：`runs` / `designs` 取数、`gate` 质量闸门、`score` 加权综合分、`top` 排序、`diversity_pick` 多样性挑选（3-mer Jaccard 序列聚类 + 每簇限选 + 稀疏惩罚）、`save_table`、`candidate_columns`；默认权重 self_dockq +0.30 / mpnn_dockq +0.25 / fnat +0.15 / iptm +0.15 / plddt +0.10 / binder_scrmsd −0.10 / complex_scrmsd −0.05
+  - 新增 2 篇配方 WIKI：`WIKI_experiment_data_map.md`（三表结构、原始结果目录映射、6 个高频坑：self vs mpnn 两套 DockQ、`binder_interface=false` 的假高分、target_key 碎片化、缺失值不等于 0、pLDDT 旧刻度、design_id 跨 run 重名）与 `WIKI_candidate_ranking.md`（唯一流程、质量闸门表、综合分权重表、三种 Top 列表口径、≤8 列输出规范、代码模板）
+  - 路由：`ProteinHarness/agents/design/CORE.md` 新增「Experiment data analysis — prefer data + code over new tools」段落，design agent 工具白名单扩到 29 个（新增 4 个通用原语 + `record_takeaway`）
+  - 沙箱安全加固：catalog 与沙箱库以 `--ro-bind` 只读挂载，audit hook 的 `read_real` 放行 `CATALOG_ROOT` / `LIB_ROOT`；`results/` 根目录遍历收敛到本用户 allow-list 的 run，`list_files` 过滤他人 run
+
+- **记忆页面与前端交互**
+  - `Interface/src/pages/UserMemory.jsx` 重写为单列布局：干实验 / 湿实验记忆切换（`/api/memory?scope=`）、单行头部（图标 + 标题 + 「最近更新 · 日期」+ 刷新按钮）、字符计数与保存状态；按用户要求去掉时分秒只保留日期，并删去标题下方的冗余说明段
+  - `Interface/src/components/TakeawayCard.jsx` 新增（替代 `MemoryRestoreCard.jsx`）：只展示靶点键 + 2-3 条要点，不再渲染版本号与匹配信息
+  - `Interface/src/components/MemoryUpdateCard.jsx` 重写：按动作标签（追加 / 合并 / 编辑）渲染新增、删除线旧值 → 新值、合并条数变化
+  - `Interface/src/i18n/LanguageContext.jsx` 中英文案同步对齐，清理 15 个已废弃 key
+
+### 结果与产出
+
+- **代码规模**：1 次提交 `af839bb`（47 文件，源码部分 34 文件 **+2517 / −508**；另清理 12 个历史哈希 JS + 3 个 CSS 共 −19100 行陈旧构建产物）
+  - 新增 11 个文件：`Backend/experiment_catalog.py`(612) / `Backend/sandbox/proteincraft_lab.py`(294) / `ProteinHarness/executors/meta_query.py`(87) / `Backend/test_experiment_catalog.py`(178) / `WIKI_experiment_data_map.md`(107) / `WIKI_candidate_ranking.md`(96) / 5 个工具 yaml + `record_takeaway.yaml`
+  - 重写：`Backend/user_memory.py`(+259/−48) / `Backend/main.py`(+89/−49) / `ProteinHarness/executors/memory.py`(+64/−59) / `Interface/src/pages/UserMemory.jsx`(+130/−104) / `MemoryUpdateCard.jsx`(+82/−69) / `WIKI_memory_update.md`(+68/−56，全量中文化)
+- **数据层实测**：catalog 构建完成 **119 runs / 10053 designs / 4 个靶点**（`liuyihao347_b9b30ce33e.sqlite`，built_at 2026-11-03T10:45），全量构建耗时 **2.27s**，单次查询 **≈17ms**
+- **测试基线**：新增 `Backend/test_experiment_catalog.py` 5 项 + `Backend/test_user_memory_structure.py` 扩充 4 项（scope 隔离、dict 归一化、历史字面量解包、仅变更载荷），连同 `Backend/test_sandbox.py` 共 **30 passed**
+- **安全验证**：只读 SQL 拦截、跨用户 catalog 隔离、跨用户 run 目录泄露、越权 `get_task_info`、沙箱内 catalog 写入被拒 —— 均已实测拦截成功
+- **部署状态**：前端产物 `index-BcpG98MX.js` / `index-BdjwDhWG.css` 已同步 `Backend/static/`，`index.html` 引用与磁盘一致；`bindagent.service` active（2026-11-03 20:56 重启），`/api/models` 返回 200
+- **记忆库现状**：`user_memories` 已带 scope 列，主账号 dry 记忆版本 v29，历史归档 365 行；wet scope 结构就绪、内容待湿实验上线后填充
+
+### 遇到的问题及解决
+
+- **记忆条目显示成字典、视觉上完全不可读**：根因是模型把 bullets 传成 `{"content": ..., "key": ...}` 对象，而 yaml schema 的 `additionalProperties: true` 没拦住，存储层再 `str()` 一下就变成 dict 字面量。修复不是只洗数据，而是写入 / 读取 / 契约三层同时收口（归一化 + 兼容解包 + schema 收紧），并单测锁死
+- **一次解读里出现 9 次 update、链路极其混乱**：直接诱因是 patch 缺 item key 被服务端拒绝后，agent 换写法逐条重试；改为严格 schema + 服务端归一化 + 单轮守卫 + 协议内联四个措施后，一次解读最多只有一次更新动作
+- **`restore_memory` 名不副实**：名为「恢复」实际只做展示，用户看到卡片语义困惑；重新定义为 `record_takeaway`（写 take-away）并同步调整 UI 事件协议（`ui:memory_restore_card` → `ui:memory_takeaway_card`、`MEMORY_RESTORE` → `MEMORY_TAKEAWAY`）
+- **更新卡把整份靶点记忆倒给用户**：改为在存储层就产出变更 diff，UI 只消费 diff，用户只看到「哪几个 item 被改了」
+- **`get_task_info` 可越权读他人任务**：抽出 `_make_task_info_builder(owner_email)` 作用域封装，chat context 与 interpret context 两处调用点统一走它，越权返回 `Error: access denied to task ...`
+- **沙箱内 `import proteincraft_lab` 被 audit hook 拒绝**：新增 `SANDBOX_LIB_ROOT` 环境变量 + bwrap `--ro-bind` 只读挂载 + audit `read_real` 放行 LIB_ROOT，三处配套改动后才可导入
+- **`grep_files` 报 `NameError: TEXT_SUFFIXES`**：mcp_server.py 里漏定义该常量，补齐后文本后缀白名单生效（此前该工具完全不可用）
+- **catalog 写入报占位符数量不匹配（24 vs 23）**：`_design_rows` 的 INSERT 语句手写占位符与列数对不上，修正为 23 个
+- **`results/` 根目录泄露其他用户的 run**：遍历逻辑改为 `_walk_bases` 限定本用户 allow-list，`list_files` 追加过滤，路径逃逸仍由 `_checked` 拦截
+- **系统 python3 跑 SQLite 报 `undefined symbol: sqlite3_deserialize`**：改用 `env -u LD_LIBRARY_PATH .venv/bin/python` 执行（venv 为 Python 3.12.3），并把 `sqlite3` 的 `with conn` 改为 try/finally 显式关闭连接，避免连接泄漏
+- **前端构建产物堆积**（每版留下 12 个哈希 js）：每次 build 后删除上一版产物，保证 `Backend/static/assets/` 与 `index.html` 引用始终一致
+
+### 下一步计划
+
+- 做一次真实线上全链路回归：用户问「从某日期起总结该靶点全部实验并给出按得分与多样性的 Top 候选表」→ 验证 agent 是否只靠 `query_table` + `run_analysis_code` + `proteincraft_lab` 组合完成，不再新增专用工具
+- 用真实实验回归新的记忆五步流程：解读 → Take away 卡 → 比对既有记忆 → 追加/合并/编辑/不更新 → 必要时横向分析 → 末端 Memory updated 卡
+- 湿实验 scope 目前只完成结构与前端切换，待湿实验数据接入后补齐记忆模板与写入口径
+- catalog 目前按 `source_max_mtime` 懒刷新全量重建，考虑改为按 run 增量 upsert，缩短长任务并发时的刷新开销
+- 复盘 `query_table` 与 `get_task_info` 的职责边界：确认「单任务实时深读」留在 `get_task_info`、`跨实验聚合」走 catalog，是否还需把实时指标统一进 catalog 口径
+- 补充 `WIKI_candidate_ranking.md` 的第四种候选列表（按靶点热点残基覆盖度挑选），把 ScanNet 热点能力接入候选排序体系
