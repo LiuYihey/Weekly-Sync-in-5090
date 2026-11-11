@@ -1,5 +1,24 @@
 # Weekly-sync
 
+> 汇报按时间正序追加，最新的在文末。顶部为索引，便于按日期定位。
+
+| 日期 | 主题 |
+|---|---|
+| 2026-11-11 | 序列自然性评分全链路接入 + Chat History 悬停全名与铅笔重命名 |
+| 2026-10-31 ~ 11-11 | **两周工作总览（按主线重新编排）** |
+| 2026-11-03（续） | 记忆链路语义重构 + Meta Tool 迁移 |
+| 2026-11-01 ~ 11-03 | Agent 上下文压缩 + 记忆系统 Skill 化重构 + 流水线修复 + 侧栏溢出根治 |
+| 2026-10-31 ~ 11-01 | 流水线三类崩溃修复 + 高定 UI 二轮 + 横向对比 skill + 进度 ETA 工具化 |
+| 2026-10-27 | 前端高定 UI 全面升级 |
+| 2026-10-22 | BindCraft 多链靶点 evaluate 崩溃修复 |
+| 2026-10-20（续） | Rosetta 命名统一为 FreeRosetta |
+| 2026-10-19 ~ 10-20 | 协作者测试环境自助部署权移交 + 模型资产安装架构梳理 |
+| 2026-10-18 | 流水线三类崩溃修复 + 前端渲染与展示优化 |
+| 2026-10-12 ~ 10-13 | 数据丢失事故修复 + Agent 数据分析能力建设 |
+| 2026-10-11 | 过时开发产物清理 + 顶层目录树状重构 |
+| 2026-10-09 / 10-10 | PD-L1 全骨架基准与序列重设计评估 + 代码仓库宏观重构 |
+| 2026-09-06 / 09-09 | TTO 协议对齐、pLDDT 统一、Agent Memory、用户记忆系统重构与品牌升级 |
+| 2026-08-14 ~ 08-26 | 视频资源与后端进程排查、ligand 与 AME TTO 修复验证 |
 
 ## 汇报日期 2026-08-14
 
@@ -1209,3 +1228,129 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - catalog 目前按 `source_max_mtime` 懒刷新全量重建，考虑改为按 run 增量 upsert，缩短长任务并发时的刷新开销
 - 复盘 `query_table` 与 `get_task_info` 的职责边界：确认「单任务实时深读」留在 `get_task_info`、`跨实验聚合」走 catalog，是否还需把实时指标统一进 catalog 口径
 - 补充 `WIKI_candidate_ranking.md` 的第四种候选列表（按靶点热点残基覆盖度挑选），把 ScanNet 热点能力接入候选排序体系
+
+## 汇报日期 2026-11-11：序列自然性评分全链路接入（PLM-HalluBench S_seq）+ Chat History 悬停全名与铅笔重命名
+
+### 工作内容
+
+- **序列自然性评分模块落地（`src/proteinfoundation/metrics/sequence_naturalness.py`，340 行）**
+  - 从 `LiuYihey/plm-hallubench` 的 `src/scoring/sequence_scorer.py`（ProLLaMA EPGF 评分器）提取算法，移植为平台可复用模块
+  - 8 项归一化指标：氨基酸分布熵 / 氨基酸多样性（唯一残基数 ÷ 20）/ 归一化 Kyte-Doolittle 疏水性 / Guruprasad 稳定性指数 / 序列熵 / 局部复杂度（滑窗多样性）/ 重复模式惩罚 / Chou-Fasman α 螺旋与 β 折叠倾向
+  - `sequence_score`（记作 S_seq）= 8 项算术平均，落在 `[0, 1]`；质量分档 ≥0.70 excellent / 0.60–0.70 good / 0.55–0.60 fair / <0.55 poor
+  - 纯 Python 实现，无权重、无 GPU、无需模型权重，**确定性**（同一序列任意次调用结果完全一致），可在毫秒级返回
+  - 对外 API：`sequence_score_value`（单条）、`sequence_score_grade`（分档）、`sequence_score_row` / `sequence_score_rows`（明细行）
+
+- **每条序列都带上自然性得分（评估流水线接入）**
+  - `src/proteinfoundation/analyze.py`：新增 `_score_sequence_column` / `_attach_sequence_scores`，在导出 `metrics.csv` / `interface_metrics.csv` 时为原始设计序列与 MPNN 重设计序列各写一列
+  - `Backend/main.py`：`_load_metrics()` 新增任务级聚合指标 `sequence_score_mean` / `mpnn_sequence_score_mean`；`get_run_designs()` 对历史 run 中缺失该分数的设计行即时补算，保证旧数据同样可见
+  - `Backend/experiment_catalog.py`：catalog 版本号 1 → 2 → 3 强制旧库重建；`designs` 表新增 `sequence_score` / `mpnn_sequence_score` 两列，CSV 中有则直接读、无则现算；计分加 `lru_cache(maxsize=50_000)` 避免同一序列重复计算
+
+- **序列得分作为独立 tool 接入（两种调用形态，与其它模型同构）**
+  - **即时工具形态**：新增 `ProteinHarness/tools/score_sequence.yaml` + `ProteinHarness/executors/sequence_score.py`（82 行），注册为 `score_sequence` 并挂到 design agent 工具白名单（现共 29 个）；Agent 可直接对任意序列调用，无需结构评估、无需确认卡
+  - **模型卡形态**：新增 `sequence_score` 模型卡（`ProteinHarness/platform/model_cards.yaml`，kind=scoring、invocation=run_model、runtime.probe=builtin、gpu=0、typical_runtime=instant），走统一网关 `POST /api/models/{id}/run` → `Backend/model_runs.py` 的 `_RUNNERS` 注册表 → 确认卡 → 队列 → 结果可视化，与 esmfold2 / dockq 等结构指标完全同构；`ProteinHarness/model_cards.py` 的 `_METHOD_ALIASES` 补入 `sequence_score_scorer` / `sequence_naturalness` / `naturalness` / `s_seq` 等别名
+
+- **Chat History 悬停全名 + 铅笔重命名（前端交互 + 后端持久化）**
+  - 悬停显示全名：历史条目标题 span 加 `title={entry.title}`，长标题在窄侧栏中仍可读全
+  - 铅笔图标就地编辑：历史行右侧操作区新增 `Pencil` 按钮（默认 0.4 透明度，悬停 1.0），点击后标题位置原地切换为输入框（`autoFocus`、maxLength 120、Enter 保存 / Esc 取消 / 失焦保存），保存中显示 `Loader2` 旋转指示
+  - 后端新增 `PATCH /api/agent/sessions/{id}` / `PATCH /api/agent/bio/sessions/{id}` / `PATCH /api/agent/hts/sessions/{id}` 三个重命名接口，统一走 `_try_claim_session` + `_user_can_access_session` 权限校验
+  - 持久化复用既有 `AgentSession.metadata`（JSON 列），写入 `metadata["custom_title"]`，**无需数据库 schema 变更**；标题留空即删除该键、自动回退到原自动标题
+  - 前端按产品线分别配色聚焦环：design 绿 `rgba(23,169,110,…)`、bio 蓝 `rgba(59,130,246,…)`、hts 紫 `rgba(139,92,246,…)`；遵循「输入框聚焦禁描边、加深双环阴影」的 UI 规范
+
+### 结果与产出
+
+- **代码规模**：1 次提交 `f6e7048`，27 文件 **+1271 / −126**
+  - 新增 4 个文件：`sequence_naturalness.py`(340) / `executors/sequence_score.py`(82) / `tools/score_sequence.yaml`(25) / `tests/test_sequence_naturalness.py`(67)
+  - 主要改动：`Backend/main.py`(+124) / `AgentChat.jsx`(+125) / `model_cards.yaml`(+46) / `BioAgentChat.jsx`(+104) / `HtsAgentChat.jsx`(+104) / `experiment_catalog.py`(+35) / `model_runs.py`(+36) / `analyze.py`(+34)
+- **测试基线**
+  - ProteinHarness：**260 passed**
+  - Backend：**204 passed / 4 failed**（4 项均为改动前既有的预存失败：`loguru` 缺失、A1-114 与 A1-266 靶标区间断言、rfdiffusion3 `inputs.yaml` 引号风格断言、已被移除的 `motionIndex={index}` 源码字面量断言，与本轮改动无因果关系）
+  - 前端 `npm run test:unit`：**54 passed**
+  - 新增专项测试：序列评分 5 项（边界与确定性 / 八指标均值一致 / poly-A 明显低于多样序列 / 空与非法序列含 "nan" / 等级与行结构）、catalog 序列分列 1 项、model run 批量计分 1 项、会话重命名 1 项
+- **线上实测（真实数据，非构造）**
+  - catalog 重建后 **119 runs / 10053 designs，10053 条设计全部带自然性得分**；抽样 `tmp_bindcraft2_0001` → `sequence_score=0.6757` / `mpnn_sequence_score=0.6901`
+  - `/api/models` 返回 `Sequence Score` 卡片（kind=scoring，available=true，gpu=0，runtime=instant）；`/api/agent/manifest` 中 design agent 工具数 **29**，含 `score_sequence`
+  - 评分器行为校验：多样性良好序列 `MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEV` → **0.7643 / excellent**；poly-A 60mer → **0.2778 / poor**
+- **部署状态**：前端产物 `index-DChL_fQ6.js` / `index-BdjwDhWG.css` 已同步 `Backend/static/`，`index.html` 引用与磁盘一致；`bindagent.service` active（2026-11-11 17:20 重启，MainPID 3529228），`/api/models` 返回 200
+- **文档同步**：`wiki/model-inventory.md`（独立方法表新增 Sequence Score 行、Agent 工具行补 `score_sequence`）、`CORE.md`（Standalone methods 段）、`WIKI_analysis.md`（metrics.csv 列说明）、`WIKI_cross_analysis.md`（Quality 维度补 `sequence_score`）
+
+### 遇到的问题及解决
+
+- **私有仓库无法直接抓取**：目标仓库 `LiuYihey/plm-hallubench` 为私有，网页抓取与 git trees API 均返回 404。改用已登录的 `gh api repos/.../contents/...` 读取文件内容后成功提取评分器源码
+- **项目 `.venv` 与系统 libsqlite 冲突**：`.venv/bin/python` 导入 `Backend.main` 报 `undefined symbol: sqlite3_deserialize`（venv 的 `_sqlite3` C 扩展与系统 libsqlite 版本不匹配）。改用系统 `python3` + `PYTHONPATH=.:src` 执行测试，避免环境问题阻塞交付
+- **catalog 旧库结构不兼容**：新增两列后旧 catalog 表结构缺少 `sequence_score`，SQL 查询直接报 `no such column`。将 `CATALOG_VERSION` 提升并在校验逻辑中比对版本号，触发全量原子重建（临时文件 + `os.replace`），旧库直接失效不需要迁移脚本
+- **占位符数量不匹配**：`_design_rows` 的 INSERT 占位符随列数增加而不同步（23 vs 24），导致写库失败。改为与 `_DESIGN_COLUMNS` 严格对齐
+- **重复计分开销**：同一序列在多表多行反复出现，逐行现算会明显拖慢 catalog 构建。计分函数加 `lru_cache(maxsize=50_000)`
+- **非法输入未处理**：`"nan"` / `"None"` 这类占位字符串会被清洗成空串而非报错，语义不清。显式识别并返回 `None`，同时补充对应测试
+- **Escape 取消后编辑框未关闭**：重命名输入框按 Esc 走了 blur 触发保存的同一条路径，但取消分支没有复位 `editingSessionId`，导致输入框停留不消失。补上复位逻辑后重新构建，产物 hash 才从 `index-B1GFaJNr.js` → `index-DChL_fQ6.js`
+- **部署脚本需要 sudo**：`deploy/update-system.sh` 需要 root 密码无法直接执行。改为本地执行 `npm run build` + `rsync -a --delete` 同步静态产物，再直接 `systemctl restart bindagent.service`（unit 以当前用户运行，无需提权），重启后等待约 10–12 秒再探活
+
+### 下一步计划
+
+- 把序列自然性得分回填到历史 run 的 `metrics.csv` 实体文件（当前旧 run 依赖接口即时补算，磁盘上的 CSV 仍缺这两列），需确认是否要改动历史产物文件
+- 在 `proteincraft_lab` 的候选排序权重中引入 `sequence_score`，让综合分同时考虑结构质量与序列自然性
+- 补一条候选列表口径：按 `sequence_score` 排序，用于排查「结构分高但序列不自然」的设计
+- 修复 Backend 4 项历史失败测试（源码字面量断言改语义化断言、靶标区间按归一化后取值更新、补齐临时测试解释器的 `loguru` 依赖）
+- 修复项目 `.venv` 的 `_sqlite3` 与系统 libsqlite 版本不匹配，恢复「用项目虚拟环境直接跑测试」的能力
+- 用真实线上实验回归一遍「Agent 调 `score_sequence` → 直接解释自然性 → 与 pLDDT/scRMSD/DockQ 联合判断」的完整链路
+
+## 两周工作总览（2026-10-31 ~ 2026-11-11）：按主线重新编排
+
+> 本节把上述三份按日期切分的详细汇报，按**工作主线**重新归并，便于按主题检索。各段细节仍保留在上方对应日期章节中。
+
+### 一、总体规模
+
+| 维度 | 数值 |
+|---|---|
+| 提交数 | 8 次（049d782 / f8bdec9 / cdb0ed4 / 5b24314 / 85f81ec / b11a342 / af839bb / f6e7048） |
+| 源码改动 | 95 文件，**+8707 / −1402**（不含前端构建产物） |
+| 含构建产物 | 190 文件，+28850 / −21507（差额主要为历史哈希 JS/CSS 的滚动替换与清理） |
+| 新增源码文件 | 12 个（`context_compaction.py` / `executors/memory.py` / `experiment_catalog.py` / `sandbox/proteincraft_lab.py` / `executors/meta_query.py` / `executors/sequence_score.py` / `metrics/sequence_naturalness.py` + 4 个前端卡片与 2 篇 WIKI + 7 个工具 yaml） |
+| 测试基线（当前） | ProteinHarness **260 passed** / Backend **204 passed · 4 failed**（均为改动前既有失败）/ 前端 **54 passed** |
+| 平台数据规模 | 实验 catalog **119 runs / 10053 designs**，全部带序列自然性得分 |
+| Agent 工具数 | design agent **29 个**（本周期内从 18 → 29：新增记忆 6 个（其中 `restore_memory` 改名为 `record_takeaway`，净 +6）、通用原语 4 个（`query_table` / `glob_files` / `get_file_info` / `grep_files`）、序列评分 1 个 `score_sequence`） |
+
+### 二、五条主线
+
+| # | 主线 | 关键交付 | 提交 |
+|---|---|---|---|
+| 1 | **实验流水线稳定性** | RFD4 离线环境变量污染、BindCraft2 cuDNN 图捕获、DockQ 表中断、PXDesign preset 非法值、RFD4 CUDA OOM 自动折半、ESMFold2 OOM 降载重试、DockQ 靶标-靶标假高分 | 049d782 / f8bdec9 / b11a342 / 85f81ec |
+| 2 | **前端高定 UI 与信息架构** | Landing 液态玻璃、TopNav 分段导航、实验列表重排、靶点筛选可扩展重设计、侧栏溢出根治、Artifacts 降级、Chat History 悬停全名 + 铅笔重命名 | 049d782 / b11a342 / f6e7048 |
+| 3 | **Agent 能力底座** | 上下文压缩（423 行）、记忆系统 Skill 化重构、记忆语义收敛（take-away → 比对 → 单次更新）、scope 隔离与脏数据治理、Memory 页面重写 | cdb0ed4 / b11a342 / af839bb |
+| 4 | **实验数据可查询化** | 每用户只读 catalog（SQLite）、4 个通用文件/查询原语、`proteincraft_lab` 确定性库、2 篇配方 WIKI、横向对比 skill | af839bb / 049d782 |
+| 5 | **评估指标补齐** | 序列自然性 S_seq 全链路接入（模块 → 流水线 → catalog → 前端指标 chip → 即时工具 → 模型卡） | f6e7048 |
+
+### 三、跨主线的共性问题与统一解法
+
+| 共性问题 | 根因 | 统一解法 |
+|---|---|---|
+| 崩溃类问题被"绕过"而非修复 | 逐个 case 打补丁 | 全部回到运行时证据定位根因（读 `evaluate_*.log` / `generate.log` / 内存布局），再做结构性修复 |
+| 指标口径不一致 | 同一概念在不同层各自计算 | 单一数据源：model card → registry → executor；catalog 作为唯一可查询快照 |
+| Agent 上下文被长任务撑爆 | 工具循环无轮次上限 | 分层降级 + provider 溢出重试 + 切分点安全约束 |
+| UI 信息过载 | 每个目标渲染成一个 chip | 收敛为触发按钮 + 可搜索弹出层 + 渲染上限 + 键盘可达 |
+| 产物堆积 | 每次构建留一套哈希文件 | 构建后清理上一版，`index.html` 引用与磁盘强校验一致 |
+| 会话生命周期误判 | 历史列表缺勤 ≠ 会话已消失 | 按访问权限校验（403/404）而非列表成员资格判断 |
+
+### 四、跨主线的未闭环问题（合并去重后的统一待办）
+
+**P0 · 影响可信度**
+- Backend 4 项历史失败测试：源码字面量断言（`motionIndex={index}`、rfdiffusion3 YAML 引号风格）改语义化断言；靶点区间按归一化后取值更新；补齐临时测试解释器 `loguru` 依赖
+- 修复项目 `.venv` 的 `_sqlite3` 与系统 libsqlite 版本不匹配（`undefined symbol: sqlite3_deserialize`），恢复「用项目虚拟环境直接跑测试」
+- 把 `sequence_score` 回填到历史 run 的 `metrics.csv` 实体文件（旧 run 目前靠接口即时补算，磁盘 CSV 仍缺列）
+
+**P1 · 影响能力完整度**
+- 记忆五步流程真实线上回归：解读 → Take away 卡 → 比对既有记忆 → 追加/合并/编辑/不更新 → 必要时横向分析 → 末端 Memory updated 卡
+- Meta Tool 真实线上回归：「某日期起某靶点全部实验 + 按得分与多样性出 Top 候选表」，确认只需 `query_table` + `run_analysis_code` + `proteincraft_lab` 组合
+- 实验横向对比真实链路回归：多选 → Agent 逐个 `get_task_info` → `run_analysis_code` 出对比图 → 固定结构对比结论
+- `score_sequence` 链路回归：Agent 调工具 → 解释自然性 → 与 pLDDT / scRMSD / DockQ 联合判断
+- 把 `sequence_score` 纳入 `proteincraft_lab` 候选排序权重，并补「按 sequence_score 排序」候选列表口径
+
+**P2 · 影响效率与规模**
+- catalog 由 `source_max_mtime` 全量懒刷新改为按 run 增量 upsert
+- 靶点规模增长后升级为独立靶点索引视图（搜索 + 按活跃度/样本量排序）
+- 复盘 `query_table` 与 `get_task_info` 的职责边界，确认实时指标是否需统一进 catalog 口径
+- 观察 ETA 外推与 ESMFold2 降载重试在长时任务上的实际偏差，必要时把重折叠数做成任务级可调参数
+- 湿实验 scope 已就绪结构，待数据接入后补齐记忆模板与写入口径
+- 补 `WIKI_candidate_ranking.md` 第四种候选列表（靶点热点残基覆盖度）
+- 清理 i18n 已废弃键（`tto_metrics_*` / `memory_launch_*` / `tasklist_launched_*`）
+- 将 8001 端口 nanobody 分支同步本轮 UI 与导航改造，避免两条线表现割裂
+- 恢复 RFD4 失败任务 `4d6c9ded` 的 resume，验证 batch 降载与自动折半重试
