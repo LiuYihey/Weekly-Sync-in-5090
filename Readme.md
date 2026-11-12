@@ -1293,6 +1293,99 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - 修复项目 `.venv` 的 `_sqlite3` 与系统 libsqlite 版本不匹配，恢复「用项目虚拟环境直接跑测试」的能力
 - 用真实线上实验回归一遍「Agent 调 `score_sequence` → 直接解释自然性 → 与 pLDDT/scRMSD/DockQ 联合判断」的完整链路
 
+## 汇报日期 2026-11-12：Agent「继续后无响应」根因定位（输出预算被推理吃光）+ tool result 裁剪重写 + 上下文摘要显式化与 Chat 分隔线
+
+### 工作内容
+
+- **卡死现象复现与证据固化（会话 `d1c7fd14-1f2`）**
+  - 从 `runtime/agent_sessions.db` 捞出停摆会话（updated_at 2026-11-11T09:31:45），journalctl 抓到三次连续空回合：`17:28:58` / `17:30:44` / `17:31:45` 均为 `Round N complete: text_len=0, tool_calls=0, stop_reason=max_tokens`
+  - SSE trace 还原单回合装配结果：`assembled blocks=[('thinking', None, 'thinking_len=14050')] tool_calls=[] stop_reason=max_tokens` —— 只有 thinking 块、没有 text、没有 tool_call
+  - 全程**未出现** `context_length_exceeded` / `prompt is too long` 等 400 报错；模型为 `MiniMax-M3.1-Flash-Preview`（M3.1 Flash 上下文窗口约 1M tokens，远大于配置的 200K）
+
+- **Token 分布实测（结论：不是上下文溢出）**
+  - 全会话估算 **158,199 tokens**，距模型窗口约 1M 有 6 倍余量；距平台自身压缩触发线 `200000 × 0.9 − 8192 = 171,808` 还差约 13K，因此**整场没有触发过一次压缩**，也就不会出现「历史对话已被压缩」标记
+  - 分块统计（会话 `metadata.llm_messages`）：
+
+    | 内容块 | tokens | 块数 |
+    |---|---|---|
+    | assistant:thinking | 53,037 | 62 |
+    | user:tool_result | 49,209 | 100 |
+    | assistant:tool_use | 44,515 | 100 |
+    | assistant:text | 6,264 | 52 |
+    | user:text | 3,382 | 7 |
+    | **合计** | **156,407** | — |
+
+  - 直接回答「tool result 裁剪是不是没起效」：**是，等于没起效**。100 条 tool_result 最大仅 3,799 字符，全部低于原 4,000 阈值，一条都没被裁；而真正吃窗口的是**完全不在裁剪范围内的 thinking（20 万字符）与 tool_use 入参（12.6 万字符）**
+
+- **裁剪规则重写（`ProteinHarness/context_compaction.py`）**
+  - 新增 `_shrink_strings()`：递归截断 tool_use input 内的长字符串（典型是分析代码）
+  - 新增 `_strip_stale_thinking()`：丢弃旧 thinking 块，仅保留最近 N 条 assistant 消息的 thinking；只剩 thinking 的 assistant 块降级为 `{"type": "text", "text": "(earlier reasoning omitted)"}`，保持 role 交替合法
+  - 新增公开函数 `strip_thinking_blocks()`：移除全部 thinking，供「关闭 thinking 重试」路径使用（provider 在 thinking 关闭时可能拒绝带 thinking 的历史）
+  - `prune_tool_results()` 由「只裁超长 tool_result」扩展为三段式：超长 tool_result（头尾保留）+ tool_use input 长字符串 + 旧 thinking；签名新增 `keep_recent_thinking`
+  - `resolve_compaction_settings()` 的 prune 字典新增 `keep_recent_thinking`（默认 2）；`__all__` 导出 `strip_thinking_blocks`
+
+- **空回合恢复与摘要透传（`ProteinHarness/agent_loop.py`）**
+  - `_compact_working_messages()` 返回值由 `list[dict] | None` 改为 `tuple[list[dict] | None, str]`（transcript + summary），所有 `return None` 改为 `return None, ""`
+  - 摘要器调用强制关闭 thinking（`summary_cfg["thinking"] = {"type": "disabled"}`），避免摘要器自己的输出预算被推理吃掉而产出空摘要
+  - `_guarded_llm_stream()` 新增空回合恢复：命中「adaptive thinking + stop_reason=max_tokens + 无 text + 无 tool_call」时，**自动关闭 thinking 重试一次**（并先剥离历史 thinking 块），日志标记 `empty max_tokens reply (thinking consumed the output budget); retrying with thinking disabled`
+  - 新增 `executed_any_tool` 标志：循环结束若既无文本又未执行任何工具，输出可见提示（按用户消息语言自动中/英切换），不再让 UI 呈现为「Agent 死了」
+  - 压缩事件 `phase: "end"` 现携带 `summary` 字段（预压缩路径与 provider 溢出重试路径都带）
+
+- **配置调整（`Backend/agent_config.json`）**
+  - `max_tokens` 8192 → **16384**（给输出留足余量）
+  - `prune_tool_results.max_chars` 4000 → **2400**，`keep_recent_messages` 保持 6，新增 `keep_recent_thinking: 2`
+
+- **上下文摘要显式化 + Chat 分隔线 UI（`Interface/src/components/AgentChat.jsx`）**
+  - 新增组件 `ContextSummaryDivider({ summary, running, isFullscreen, t })`：左右细线 + 居中文案（运行中显示「正在压缩历史对话」，完成显示「历史对话已被压缩」），下方挂显式摘要卡片（`AssistantMarkdown` 渲染，超高内部滚动 `maxHeight: 260`、`overflowWrap: anywhere`、`contain: inline-size`）
+  - 渲染分支插在 toolcall 分支最前：`compact_context` 不再走通用工具卡；`status === 'error'`（无可安全丢弃内容、压缩被跳过）直接不渲染，**绝不谎称「已压缩」**
+  - `messageHasRail()` 对 `compact_context` 返回 false —— 压缩是「分界线」不是工具节点，rail 连接线应在此断开
+  - 删除旧的 `META.compact_context`（Archive 图标工具卡样式）与 `Archive` import
+  - `Backend/main.py` 的 `_commit_context_compaction()` docstring 同步说明：卡片携带 `summary`，实时 SSE 与 DB 回填共用同一卡片形态
+
+- **中英文案（`Interface/src/i18n/LanguageContext.jsx`）**
+  - EN：`context_summary_label: 'Conversation history compacted'` / `context_summary_compressing: 'Compacting conversation history'`
+  - ZH：`context_summary_label: '历史对话已被压缩'` / `context_summary_compressing: '正在压缩历史对话'`
+
+- **回归测试补充**
+  - `ProteinHarness/test_context_compaction.py`：`test_old_thinking_blocks_are_dropped_but_recent_ones_survive`、`test_long_tool_inputs_are_trimmed`
+  - `ProteinHarness/test_unbounded_rounds_compaction.py`：压缩 end 事件断言含 summary；新增 `EmptyReplyRecoveryTests`（`test_retries_once_with_thinking_disabled`、`test_silent_turn_surfaces_a_visible_notice`）
+
+### 结果与产出
+
+- **根因结论（三条独立证据链互证）**：**不是上下文长度溢出**。真正原因是 adaptive thinking 把 `max_tokens` 全耗在推理上，产出「0 文本 + 0 tool_call」的空回合，前端因此什么都不显示；叠加「裁剪规则存在盲区」——thinking 与 tool_use 入参压根不在裁剪范围内，导致 158K token 的历史被原样重发，模型每轮都在重读自己早已过时的长推理
+- **裁剪规则实测收益（对同一卡死会话回放）**：`before 158,199 → after prune 94,114` tokens，**降幅 40.5%**；其中 thinking 字符从 20 万降至 34,684，裁剪后 `should_compact = False`（94K < 171,808 触发线），既保住了上下文又不必触发有损压缩
+- **代码规模**：8 个源文件 **+423 / −35**
+  - `ProteinHarness/context_compaction.py`(+164) / `agent_loop.py`(+109) / `Interface/src/components/AgentChat.jsx`(+65) / `test_unbounded_rounds_compaction.py`(+67) / `test_context_compaction.py`(+35) / `Backend/agent_config.json`(+7/−4) / `Backend/main.py`(+7/−4) / `LanguageContext.jsx`(+4)
+  - 产物同步：前端构建产物滚动替换（旧 `index-DChL_fQ6.js` → 新 `index-Duo6lAY-.js`，旧 `index-BdjwDhWG.css` → 新 `index-B43PG_yL.css`）
+- **测试基线**
+  - ProteinHarness：**264 passed**（较上期 260 新增 4 项，全绿）
+  - 前端 `npm run test:unit`：**54 passed / 0 failed**
+  - Backend 未触碰测试范围（本轮 Backend 改动仅 docstring）
+- **部署状态**
+  - 后端 `bindagent.service` 已重启生效（MainPID 3794138，15:54:44 启动完成），`/api/models` 返回 200，会话恢复 131 design / 58 bio / 2 hts
+  - 前端产物已 `rsync -a --delete` 同步至 `Backend/static/`（nginx root），页面引用 hash 与磁盘一致：`assets/index-Duo6lAY-.js` / `assets/index-B43PG_yL.css`
+
+### 遇到的问题及解决
+
+- **「上下文溢出」这一初始假设被证伪**：日志显示 stop_reason 是 `max_tokens` 而非 provider 的长度错误，两者都表现为「没输出」，但前者是**输出预算**耗尽、后者是**输入窗口**溢出。改为直接查 DB 的 `metadata.llm_messages` 做分块 token 统计，用数据而非直觉定位
+- **裁剪「看似执行但一条没裁到」**：原实现只处理「单条 tool_result 超过 4000 字符」的情况，而真实会话里 100 条 tool_result 全部在 3,799 字符以下。**根因是裁剪维度选错了**——按「单块大小」裁剪，挡不住「块数多 + 单块中等」的膨胀。改为从「块类型」维度切入（tool_result / tool_use input / thinking 三类一起裁）
+- **provider 在 thinking 关闭时拒绝带 thinking 的历史**：空回合重试若直接关 thinking，历史里的 thinking 块会让 provider 报错。新增 `strip_thinking_blocks()` 在重试前净化历史（同时把纯 thinking 的 assistant 块降级为占位 text，保持 role 交替合法）
+- **摘要器自己也会空输出**：摘要调用同样走 adaptive thinking，其 4096 token 预算被推理吃光，产出空摘要导致压缩「看起来没生效」。强制摘要器关闭 thinking
+- **不能用 sudo 重启后端**：`sudo bash deploy/restart-bindagent.sh` 报 `a terminal is required to read the password` / `sudo: a password is required`。查明 `bindagent.service` 的 `User=lyh` 以当前用户运行，**直接 `systemctl restart bindagent.service` 即可**，无需提权
+- **`.venv/bin/python` 导入 sqlite3 报 `undefined symbol: sqlite3_deserialize`**：环境 `LD_LIBRARY_PATH` 污染导致 venv 的 `_sqlite3` 扩展加载到不兼容的系统 libsqlite。用 `env -u LD_LIBRARY_PATH .venv/bin/python` 绕过
+- **裁剪函数返回值判断 bug**（实现初版）：`changed=False` 但 thinking 已被裁掉时会错误返回原对象，导致调用方误判「没有变化」。改为 `if not changed and stripped is out: return messages`
+- **空回合恢复测试首轮失败**（期望 `Recovered.`，实得中文兜底提示）：stub 第二次调用只 yield 了 `turn` 事件、未 yield `text` 事件，而 `turn_text` 只从 text 事件累积。补齐 stub 的 text 事件，并传入带 thinking 块的 history 以覆盖「关 thinking 前必须剥离历史 thinking」的断言
+- **前端产物未同步导致页面仍引用旧 hash**：nginx root 是 `Backend/static`，只 `npm run build` 不生效。补 `rsync -a --delete Interface/dist/ Backend/static/`，之后 `curl http://127.0.0.1/` 返回新 hash
+
+### 下一步计划
+
+- 回到会话 `d1c7fd14-1f2` 点「继续」做线上回归，确认三条日志标志均出现：(a) 裁剪 `pruned oversized tool results -> ~94K est tokens`；(b) 若仍空回合会自动关闭 thinking 重试；(c) 触发压缩时 chat 出现「历史对话已被压缩」分隔线与显式摘要卡片
+- 前端浏览器端强制刷新一次（`Ctrl/Cmd + Shift + R`），避免旧 bundle 缓存
+- 把「输出预算被推理吃光」这条经验沉淀进 Agent 提示词/配置规范：长任务场景显式给足 `max_tokens`，或对 reasoning 密集任务默认关闭 adaptive thinking
+- 观察压缩分隔线在真实长会话中的出现时机是否合理（当前触发线 171,808 在 200K 窗口下偏晚，考虑与新的裁剪规则联合标定）
+- 评估 `keep_recent_thinking=2` 的取值：过小会丢失当前轮推理上下文，过大会重新膨胀；需用真实长任务回归校准
+- 将本轮改动提交入库（当前 8 个文件为工作区未提交状态），并把「空回合 / 输出预算耗尽」加入 Agent 可观测性日志的固定检查项
+
 ## 两周工作总览（2026-10-31 ~ 2026-11-11）：按主线重新编排
 
 > 本节把上述三份按日期切分的详细汇报，按**工作主线**重新归并，便于按主题检索。各段细节仍保留在上方对应日期章节中。
