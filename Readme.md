@@ -1447,3 +1447,75 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - 清理 i18n 已废弃键（`tto_metrics_*` / `memory_launch_*` / `tasklist_launched_*`）
 - 将 8001 端口 nanobody 分支同步本轮 UI 与导航改造，避免两条线表现割裂
 - 恢复 RFD4 失败任务 `4d6c9ded` 的 resume，验证 batch 降载与自动折半重试
+
+## 汇报日期 2026-11-13：Agent 工具数据面改造（批量数据不再穿过模型）+ 死循环根因取证 + 工具设计完全指南
+
+> 承接 11-12 的「Agent 继续后无响应」修复。本轮解决的是紧随其后的第二个症状：Agent 在大批量任务上**反复重打、反复转录、反复校验**，界面表现为 `score_sequence` 与 `Running analysis` 交替刷屏、迟迟不出结果。根因不是提示词没写好，而是**数据通路穿过了模型**。
+
+### 工作内容
+
+**一、取证：定位「重复执行分析与工具调用」的真实成因**
+
+从会话库 `runtime/agent_sessions.db` 拉取问题会话 `d1c7fd14-1f2` 原始消息做量化分析（237 条消息）：
+
+| 工具 | 次数 | 说明 |
+|---|---|---|
+| `run_analysis_code` | **76** | 其中 31 次内嵌了数值数据行字面量（126 行） |
+| `score_sequence` | **38** | 累计打分 **796 条序列**，工具入参共 **47,013 字符**（全部由模型逐 token 生成） |
+| `query_table` / `read_wiki` / `write_todos` | 3 / 3 / 3 | 正常读与规划 |
+| `save_artifact` / `read_target_memory` / `glob_files` / `record_takeaway` / `update_target_memory` | 2 / 1 / 1 / 1 / 1 | 收尾类 |
+
+- `run_analysis_code` 代码总量 **174,527 字符**，工具入参总量 **252,597 字符** —— 这些字节本不必经过模型
+- assistant 正文里有 **89 行**「每行 ≥5 个数字」的转录表格，即分数被手工敲进对话再敲进代码
+- **模型自述的证据**（会话原文）：「label 158 的行是我误抄了 label 159 的数据」「转录中发现多处标签漂移，必须重建」「158 确认是 0.7134（我之前误抄成 0.6879）」
+
+**结论**：死循环链条是 `score_sequence` 只能内联收序列 → 分数只活在对话里、没落盘 → 必须重打才能继续 → 重打会错 → 写代码校验 → 失败 → 再重打 → 下游全部重跑。**它不是"不听话"，是它没有"复制"这个操作**——模型输出是概率采样而非内存拷贝，几百行数字必然串行、错位、凭印象补数；且数据只存在于上下文，被 prune/compaction 裁掉后模型就从"抄"变成"编"。
+
+**二、工具数据面改造（核心交付）**
+
+新增「输入走文件、输出落盘」的双通道，把字节从 token 通路移到文件系统：
+
+- **`score_sequence`（`ProteinHarness/executors/sequence_score.py`，+330/−29；工具定义 `tools/score_sequence.yaml`）**
+  - 新增 `input_path`：从沙箱读 CSV/TSV/JSON/FASTA/纯文本，优先于 `sequence`/`sequences`；自动识别"看起来像序列"的列（`_guess_sequence_key`）与名称列；非氨基酸字符剥离，无有效残基的行跳过并计数
+  - 新增 `output_path`：把完整结果表写成 13 列 CSV（`name, sequence, length, sequence_score, grade, aa_distribution, aa_diversity, normalized_hydrophobicity, stability, sequence_entropy, local_complexity, repeat_pattern, secondary_structure`），**对话只回摘要**（行数 + 列名 + 路径 + 读回方式），不截断
+- **`query_table`（`executors/meta_query.py`，+59；`tools/query_table.yaml`）**
+  - 新增可选 `output_path`：结果行写成 CSV（完整单元格值，不做 markdown 的 80 字符截断），命中行数上限时显式提示 `LIMIT/OFFSET` 分页；**不传该参数时行为一字未改**
+- **产物自动可见**：写入 `artifacts/` 前缀的文件由 sandbox 自动注册为 `ui:artifact`，直接出现在聊天里可下载
+- **描述层同步**（否则模型不会用新参数）：`tools/write_file.yaml` 增加「不要用 write_file 持久化工具输出」；`tools/read_file.yaml` 增加「大表不要读进对话」；`ProteinHarness/agents/design/CORE.md` 新增第 6 条硬规则「禁止把工具输出重打进代码或 write_file」
+- **命名去专有词**：`score_sequence` 的描述、模型卡、运行时摘要、wiki 全部去掉 `PLM-HalluBench` / `EPGF` / `S_seq`，统一表述为 **sequence score**（同时保留 `src/proteinfoundation/metrics/sequence_naturalness.py` 里对上游实现的溯源注释——那是给开发者看的，与用户可见文案无关）
+
+**三、全部 design 工具逐个审计（28 个）**
+
+- **已改 4 个**：`score_sequence`、`query_table`、`write_file`（描述）、`read_file`（描述）
+- **无需改（正确设计，保持原样）**：`run_analysis_code`（本身即数据面计算入口）、`get_task_info` / `read_wiki` / `read_target_memory` / `list_target_experiments`（**读工具**——模型必须看到全细节才能推理，"读全 ≠ 搬全"）、`predict_structure` / `fetch_pdb` / `run_model` / `launch_experiment`（单条输入）、`save_artifact` / `list_files` / `glob_files` / `grep_files`（已引用式或带上限）
+
+**四、工具设计完全指南（`.cursor/rules/tool-design-data-plane.mdc`，新文件 96 行）**
+
+把本轮经验固化为可复用规范：总原则（**模型=控制面，字节=数据面**）、内联批量数据的 4 类失效机制（成本翻倍 / 保真度 / 易失性 / 规模上限）、场景决策表、**5 条行业标准模式**（Handle over value · Push compute to data · Preview + handle · 双通道输出 · 类型化契约+幂等）、**新增工具 7 项验收清单**、**12 个容易踩的坑**、本项目参考实现、以及 Review 时直接拒绝的 5 种写法。
+
+### 结果与产出
+
+- **代码规模**：13 个文件 **+665 / −50**（`sequence_score.py` +330、`meta_query.py` +59、`test_sequence_score_tool.py` +117 新增、`test_query_table_tool.py` +111 新增、`score_sequence.yaml` +19/−6、`query_table.yaml` +6、`write_file.yaml` +5/−2、`read_file.yaml` +5/−3、`CORE.md` +4/−1、`model_cards.yaml` +4/−4、`model_runs.py` +2/−2、`test_model_runs.py` +1/−1、`wiki/model-inventory.md` +2/−2）
+- **测试基线**：ProteinHarness **275 passed**（较上期 264 新增 11 项，全绿）
+  - `test_sequence_score_tool.py`（6 项）：inline 仍工作、`input_path`+`output_path` CSV 往返、JSON/FASTA 解析、无效残基跳过并报告、缺文件/无沙箱报错、CSV 无序列列报错
+  - `test_query_table_tool.py`（5 项）：**不传 `output_path` 时 markdown 原行为不变**（仍 80 字符截断）、`output_path` 写全值 CSV + artifact 事件、命中上限提示 `LIMIT/OFFSET`、无沙箱报错、空结果
+- **线上校验**：`bindagent.service` active、`/api/models` 200；registry 实测 spec 已含新参数 —— `query_table → [sql, limit, format, output_path]`、`score_sequence → [sequence, sequences, names, input_path, output_path]`
+- **入库**：提交 `86a156d`（24 文件 +1094/−91，含前端构建产物滚动替换），已推送 `origin/main`，本地与远端 `0/0` 同步
+- **数据交付物**（会话产出，已在聊天中可见）：`CD8_binder_200_S_seq_.csv`（200 行 × 34 列）、`CD8_binder_200_FASTA.fasta`（200 条）
+
+### 遇到的问题及解决
+
+- **初版 `query_table` 测试失败**：`assert ... in result.llm_content` 不成立——测试里的 `LONG_SEQUENCE` 只有 69 字符，压根没触发 80 字符截断阈值。改成两段拼接（138 字符）后才真正覆盖到截断分支
+- **`_write_text` 返回值签名不一致**：先设计成返回 `str | None`，但 artifact 事件需要一并回传。两个 executor 同步改为返回 `(error, artifact)` 元组
+- **首版写 `artifacts/` 时产物不可见**：`write_file` 只在路径以 `artifacts/` 开头时才返回 artifact 描述，executor 直接丢弃了它。改为捕获 `result.get("artifact")` 并转成 `ui_events=[{"type": "ui:artifact", "data": artifact}]`，测试补断言
+- **一度把"读工具"也误判为该 handle 化**：初稿把 `launch_experiment` / `get_task_info` 与搬运型工具并列，用户指出这是刻意的"给 agent 读全细节"设计。收回该判断，并在指南中明确区分**读工具内联返回是正确的**——只有需要持久化、交给别的工具、或喂给分析代码时才需要句柄
+- **`.cursor/` 被 `.gitignore` 忽略**：新规则文件只存在于本地，不进版本库，团队无法共享（详见下一步）
+
+### 下一步计划
+
+- **规则文件的版本管理待决策**：`.cursor/` 与 `.trae/` 都在 `.gitignore`（`.gitignore:152`）。两个选项：① 移到 `docs/` 或 `wiki/` 纳入版本管理；② `git add -f` 强制加入。待确认后执行
+- **用新参数做真实回归**：在 Agent 上重跑一批 CD8 序列打分（走 `input_path` + `output_path`），确认不再出现手抄与重打，界面上只出现一次 `score_sequence`
+- **`query_table` 单次导出上限 1000 行**（沿用 `MAX_QUERY_ROWS`）：若需"一次导出全部"，要另开一条不受限的导出路径
+- **把 `sequence_score` 回填到历史 run 的 `metrics.csv`**：磁盘实体文件仍缺列，旧 run 目前靠接口即时补算
+- **把 `sequence_score` 纳入 `proteincraft_lab` 候选排序权重**，并补"按 sequence_score 排序"的候选列表口径
+- **观察上下文裁剪与新数据面的相互作用**：数据落盘后对话里只剩摘要，需确认 compaction 触发线（171,808）能相应下调
