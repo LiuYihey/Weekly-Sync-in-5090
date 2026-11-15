@@ -1519,3 +1519,111 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - **把 `sequence_score` 回填到历史 run 的 `metrics.csv`**：磁盘实体文件仍缺列，旧 run 目前靠接口即时补算
 - **把 `sequence_score` 纳入 `proteincraft_lab` 候选排序权重**，并补"按 sequence_score 排序"的候选列表口径
 - **观察上下文裁剪与新数据面的相互作用**：数据落盘后对话里只剩摘要，需确认 compaction 触发线（171,808）能相应下调
+
+## 汇报日期 2026-11-13 ~ 2026-11-16：Binder 序列池 Top-N 交付体系（审计 → Skill 化 → 平台接入）+ Agent 常驻上下文瘦身（CORE/WIKI 分层）
+
+> 本轮是两条并行的主线：**一是把「从靶点生成的 binder 序列池里挑出可做湿实验验证的最优序列」这件事，从一次性的人工分析变成可复现、可被 Agent 自动调用的标准能力**（含一次对既有 Top200 交付物的质量审计）；**二是把 Agent 的常驻提示词从「一份大 CORE 文档」改成「CORE 路由 + WIKI 按需加载」**，解决默认模型硬编码与上下文膨胀两个问题。
+
+### 工作内容
+
+**一、Top200 交付物质量审计（先查账，再改）**
+
+对平台此前产出的 CD8 binder Top200 名单做了逐项复算，结论分为三档：
+
+| 档位 | 发现 | 证据 |
+|---|---|---|
+| **算对了** | `weighted_score` 与 `pc.score` 一致（误差 8e-17）；`pct_*` 全部可复算；方向反转只做一次；权重和 = 1.00；rank 严格降序；200 条序列唯一；全部过 gate；CSV 87 列含全部指标；FASTA 200 条与 CSV 一一对应；3-mer Jaccard 最大 0.333 | 独立脚本重算比对 |
+| **P0（阻断可信度）** | ① `max_per_model=70` 是**隐藏参数**——交付脚本里默认 `None`，重跑会得到 93 条 RFD4、且与原名单只重合 177/200 ⇒ **产出不可复现**；② `pool_rank` 与 `rank` 完全相同，语义错误（它本应是「合格池内纯分数排名」，被写成了最终名次） | 重跑脚本 + 列值比对 |
+| **P1（湿实验前必被质疑）** | ① **42% 的 dG 为正**（池中位数 +1.57、最大 +2332，且与 DockQ 正相关 0.455；genie3 / boltzgen 全部为正）——当前 dG 口径不可信却被写进排序；② `interface_area` 只做了 clip 不做剔除（17/200 > 2500、87/200 > 2000）；③ `fnat/iptm/plddt` 被标成 MPNN 态，实际是 self（生成态）——**状态标注错误会误导选型** | 分布统计 + 相关性 |
+| **P2（成本与冗余）** | ① 指标高度冗余：`interface_area`↔`n_ifres` ρ=0.912、`iptm`↔`plddt` ρ=0.857、`ret`↔`jac` ρ=0.747、`sequence_score`↔`mpnn_sequence_score` ρ=0.741——直接加权等于重复计权；② 多样性配额代价过大：仅 132/200 落在纯分数 Top200 内，cutoff 从 0.5621 掉到 0.4436；5 个表位簇各占 25 条 = 125/200 | 相关性矩阵 + 名额追溯 |
+
+**二、V2 短名单引擎（`Backend/sandbox/proteincraft_lab.py`，+659 行）**
+
+针对上述三档问题重建打分与筛选规则，全部配置化并写入产物 manifest：
+
+- **分块预算（block budgeting）**：按「概念」而非「指标个数」分权，避免相关指标重复计权。7 个块：`interface_mpnn` 0.30 / `stability` 0.15 / `epitope` 0.20 / `naturalness` 0.15 / `generation_self` 0.10 / `geometry` 0.10 / `energetics` 0.00
+- **加权口径**：百分位归一化在**合格池内**做；「越低越好」的指标用 `1 - pct` 做**一次**方向反转；权重符号只声明方向，实际加权取 `|weight|`；缺失指标**收缩权重分母**而不是补 0（避免把「没测」当成「很差」）
+- **闸门（gates）**：`mpnn_dockq ≥ 0.50`、`binder_scrmsd ≤ 2.0`、`mpnn_binder_scrmsd ≤ 2.0`、`interface_area ∈ [900, 2500]`、`n_interface_residues ∈ [40, 120]`、`ret_gen_mpnn ≥ 0.60`、`sequence_score ≥ 0.645（分位 0.20 + 绝对下限 0.55）`、`epi_gen_n ≥ 1`；dG 改为 **diagnostic**（只打 `dg_flag`，不参与否决，Rosetta 协议未验证前不启用 gate）
+- **两段式选择**：150 条 score-top + 50 条 diversity；全局 caps（每模型 ≤ 70、每表位簇 ≤ 25、每 Foldseek 簇 ≤ 5）+ diversity 层更紧 caps（≤ 25 / 10 / 3）
+- **可复现性**：`config_hash`（配置 SHA-256）+ 输入哈希 + 输出哈希 + manifest JSON + 排序 tie-breaker（run_name / design_id）+ 稳定排序 ⇒ **重复运行字节级一致**
+- **状态分离**：`self_dockq/iptm/plddt/ipae` 明确标为生成态；`mpnn_dockq/fnat_mpnn_from_csv/mpnn_complex_i_pTM/mpnn_complex_pLDDT` 标为重设计+复折叠态
+
+**三、Skill 化（IDE 侧 `.trae/skills/binder-shortlist/`，4 文件 335 行）**
+
+- `SKILL.md`（89 行）：frontmatter 的 `description`（202 字符）只描述「何时该用」，正文放触发条件、输入契约、各指标方向表、运行命令、输出说明、交付前检查清单、硬规则
+- `scripts/rank_shortlist.py`（96 行）：CLI（`--input/--prev-top200/--out-dir/--prefix/--config/--n/--n-score-top/--dg-policy/--print-config`），与平台共用同一份 `proteincraft_lab` 实现
+- `references/metrics.md`（58 行）/ `references/selection.md`（92 行）：分块权重表、闸门表、P0/P1/P2 修复对照表、合格池与排名语义
+
+**四、平台接入（Agent 可自动触发）**
+
+- `ProteinHarness/executors/shortlist.py`（207 行）：`RankBinderShortlistExecutor`，在沙箱内执行 `run_analysis_code`；沙箱路径校验（必须 `data/` 或 `artifacts/`、禁绝对路径与 `..`）、prefix 正则校验、`dg_policy` 白名单
+- `ProteinHarness/tools/rank_binder_shortlist.yaml`（41 行）：`agents: [design]`，输入契约 `feature_table`（必需）/ `prev_top200` / `prefix` / `n` / `n_score_top` / `dg_policy` / `config`
+- `ProteinHarness/registry.py`：注册工具；`ProteinHarness/agents/design/profile.yaml` 挂载给 design agent
+- `ProteinHarness/agents/design/WIKI_binder_shortlist.md`（89 行）：唯一流程、工具调用示例、默认规则 V2、回答结构、禁止项（「不要自己重新实现权重/闸门/配额」）
+- `ProteinHarness/agents/design/WIKI_candidate_ranking.md`：顶部加指针，湿实验 Top-N 场景改走 `WIKI_binder_shortlist`
+
+**五、交付产物（CD8 靶点，全流程跑通）**
+
+| 项 | 数值 |
+|---|---|
+| 输入合格池 | 697 行 |
+| 过闸门 | **450** 行（被拒主因：`sequence_score` 118、`interface_area_max` 49、`ret_gen_mpnn` 34） |
+| 输出 | **200** 条（score_top 150 + diversity 50） |
+| 与旧 Top200 关系 | 保留 **150** / 替换 **50** |
+| 模型分布 | RFD4 70 / BindCraft 48 / PXDesign 39 / BoltzGen 31 / Genie3 7 / BindCraft2 5（**恰好卡在 ≤70 的 cap 上**） |
+| 表位簇 / Foldseek 簇 | 各簇 ≤25 / ≤5，全部合规 |
+| `interface_area` 最大值 | 2499（不再出现 >2500） |
+| 正 dG | 82 条，**仅打 flag 不否决**，manifest 内附警告 |
+| CSV | 200 行 × 103 列（含全指标明细 + 自定义加权打分 + 闸门原因 + 排名语义） |
+| FASTA | 200 条，header 内嵌 rank/model/len/score/mpnn_dockq/ret/seq_score/tier/config hash |
+| `config_hash` | `a4dc28987b01a46fb31e6f1c1b083d94da5c4edc7421fb66d86c4fd07bb3baf7` |
+| 可复现性 | 重复运行 CSV/FASTA **字节级一致** |
+
+产物路径：`outputs/2026-11-13/binder_shortlist_v2/`（CSV / FASTA / manifest 三件套），同时已注册为平台 artifact，可在聊天内直接下载。
+
+**六、流式输出乱码修复（U+FFFD）**
+
+- 根因：流式分块把一个 3 字节汉字拆成 2+1 字节分别解码 ⇒ 产生两个 U+FFFD 替换字符
+- 修复：`ProteinHarness/text_sanitize.py` 新增 `strip_replacement_chars()` 并接入 `sanitize_assistant_text()`；`Backend/main.py` 的 `_commit_text` 在落库前清洗；历史脏数据用脚本订正（`多做了<2×U+FFFD>次方向反转` → `多做了一次方向反转`）
+- 回归：`ProteinHarness/test_text_sanitize.py` 新增 1 项用例（`0.4\ufffd2` → `0.42`）
+
+**七、Agent 常驻上下文瘦身：CORE / WIKI 分层重构**
+
+先把问题讲清楚：平台侧**没有**通用的 `SKILL.md` 运行时（无 `activate_skill`），流程知识收敛为 `CORE.md`（常驻）+ `WIKI_*.md`（按需 `read_wiki`）+ tools（强类型动作）三层。标准 Agent Skill 的 `name` + `description` 会**常驻**模型上下文，正文按需加载——所以 skill 数量多时 description 确实会占上下文，工业界的做法是 progressive disclosure + 检索/路由 + 延迟工具发现 + prompt caching。本轮据此做了三层改造：
+
+1. **CORE 瘦身**：255 行 / 19,935 字符 → **164 行 / 10,135 字符（−49%）**。下沉的内容：公共实验参数表 → `WIKI_launch_params`；Progress & ETA 字段表 → `WIKI_results`；Memory / Cross-analysis / To-do / Literature / Tool protocol 细节各自下沉到对应 WIKI
+2. **新增 WIKI 目录**：`WIKI_INDEX.md`（15 行目录表：name / 覆盖内容 / 何时读）+ `WIKI_launch_params.md`（公共参数与 presets）。design agent 现有 WIKI 共 **16 篇**
+3. **去掉默认骨干模型的硬编码**：CORE 不再写死任何模型名，改为「读 `list_models` / `read_model_card`；平台默认 = `list_models` 里标 `default` 的那个（数据源 `model_cards.yaml`）」；`executors/models.py` 的 `list_models` 输出新增 `Platform default: **Proteina-Complexa** (proteina).`
+4. **read_wiki 描述去枚举**：从列举全部 WIKI 名改为 115 字符指针——「Read WIKI_INDEX first when you need the catalog or are unsure which document to load.」
+
+当前常驻开销实测：system prompt 16,821 字符（CORE 10,135 + Capability catalog 6,806 + 其他），design agent 工具数 30。
+
+### 结果与产出
+
+- **代码规模**：提交 `9930c3a`，**18 文件 +1391 / −184**（`proteincraft_lab.py` +659、`executors/shortlist.py` +207 新增、`test_binder_shortlist.py` +198 新增、`rank_binder_shortlist.yaml` +41 新增、`WIKI_binder_shortlist.md` +89 新增、`CORE.md` 235 行重写、`registry.py` +16/−8、`text_sanitize.py` +11）
+- **测试基线**：
+  - ProteinHarness **276 passed**（全绿）
+  - `Backend/test_binder_shortlist.py` **7 项全过**（输出契约与确定性、CSV/FASTA/manifest 落盘、prev_top200 重叠、缺失可选列降级、dG flag/gate 行为、平台工具注册、executor 转发）
+  - `Backend/test_agent_action_parser.py` **140 passed / 3 failed**——3 项均为改动前既有失败（前端 `motionIndex={index}` 字面量断言、靶点区间夹具 `A1-114` vs `A1-266`、PyYAML key 引号风格）
+- **交付物**：`CD8_binder_top200_v2.csv`（890 KB）、`CD8_binder_top200_v2.fasta`（36 KB）、`CD8_binder_top200_v2_manifest.json`（4.8 KB），平台 artifact 同名三件套
+- **可复现性**：同一输入重复运行，CSV/FASTA **字节级一致**（manifest 记录 config_hash / 输入哈希 / 输出哈希）
+- **额外入库**：`交底书初稿-一种靶点记忆自进化与多智能体编排的蛋白质设计方法及系统.docx`（2.1 MB）
+
+### 遇到的问题及解决
+
+- **初版 `weighted_score` 不可复现**：交付的 200 条与 `select(pool, max_per_model=70)` 逐行一致，但保存的 `weighted_rank.py` 默认 `max_per_model=None`——重跑得 93 条 RFD4、仅 177/200 重合。修复：把 `max_per_model_global=70` **写进 `SHORTLIST_CONFIG` 并落进 manifest**，配置随产物走
+- **`pool_rank` 与 `rank` 完全相同**：V2 改为「合格池纯分数排名」，diversity 条目的 pool_rank 落在 235–391，与最终名次解耦
+- **测试 fixture cap 不足**：`synthetic_pool()` 里 `fs_key` 用 `index % 20`，Foldseek 簇只有 20 个、cap 5 ⇒ 只能选 100 条，报 `shortlist produced 100 rows, fewer than n=200`。修复：`fs_key` 改为每行唯一
+- **单测断言写错**：初版期望 `多做了<2×U+FFFD>次方向反转` → `多做了一次方向反转`（正则剥掉替换字符后不含「一」）。修复：改用 `0.4\ufffd2 → 0.42` 场景
+- **CORE 瘦身后 prompt 回归测试失败**：`native tool_use` 因加了反引号而未被匹配、Launch 卡片措辞缺失、硬编码模型名断言失效。修复：调整措辞并把断言改为 `list_models` / `read_model_card` / `model_cards.yaml` / `backbone_models` / `platform default` / `model_id`
+- **环境坑**：Trae 注入的 `LD_LIBRARY_PATH` 指向破损 libsqlite3，导致 `sqlite3_deserialize` undefined symbol。所有后端启动与 python 调用统一改为 `env -u LD_LIBRARY_PATH`；后端用 `run_in_background` 常驻，避免 `nohup` 随 shell 退出被杀
+- **`.trae/` 被 `.gitignore` 忽略**（`.gitignore:153`）——与上一期 `.cursor/` 同类问题，新建的 Skill 目录与规则文件目前只在本地，团队无法共享（详见下一步）
+
+### 下一步计划
+
+- **Skill 目录的版本管理待决策**：`.trae/skills/binder-shortlist/`（SKILL.md + references + scripts）与上一期的 `.cursor/rules/` 都落在 `.gitignore` 里。① 移到 `docs/` 或 `wiki/` 纳入版本管理；② `git add -f` 强制加入。待确认后执行
+- **压缩常驻上下文的下一步**：把 `build_capability_catalog`（当前 6,806 字符）压成「工具名 + 一句话」，完整描述继续走 `get_tool_spec` 按需获取——这是剩下最大的常驻收益点
+- **WIKI 规模监控**：现有 16 篇，`WIKI_INDEX` 足够；超过约 30 篇时引入 `search_wikis`
+- **清理后端残留的模型兜底**：`Backend/main.py` 中残留的 `or "proteina"` / `["proteina"]` fallback（第 2027、2117、11215、11377 行）改为 `_catalog_default_model_id()`，或在 `scenes.yaml` 增加 per-scene `default_backbone`
+- **dG 口径闭环**：验证 Rosetta `dg_separated` 协议后，再决定是否启用 `dg_policy="gate"` 或给 energetics 块非零权重；在此之前 dG 只做诊断标记
+- **回归 3 项既有失败测试**：把源码字面量断言改成语义化断言、靶点区间按归一化后取值更新、rfdiffusion3 YAML 断言改用 YAML 解析而非字符串匹配
