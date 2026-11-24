@@ -1627,3 +1627,77 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - **清理后端残留的模型兜底**：`Backend/main.py` 中残留的 `or "proteina"` / `["proteina"]` fallback（第 2027、2117、11215、11377 行）改为 `_catalog_default_model_id()`，或在 `scenes.yaml` 增加 per-scene `default_backbone`
 - **dG 口径闭环**：验证 Rosetta `dg_separated` 协议后，再决定是否启用 `dg_policy="gate"` 或给 energetics 块非零权重；在此之前 dG 只做诊断标记
 - **回归 3 项既有失败测试**：把源码字面量断言改成语义化断言、靶点区间按归一化后取值更新、rfdiffusion3 YAML 断言改用 YAML 解析而非字符串匹配
+
+## 汇报日期 2026-11-17 ~ 2026-11-24：Landing 开场动画（Swarm 六智能体协同）落地 + 应用内 Chat / Auth / 导航一揽子打磨
+
+> 本轮主线是**把 Landing 首页的开场从"静态首屏"升级为一段有叙事的动画**：六个智能体在遮罩下分工把整页内容"打"出来，真实蛋白窗口从遮罩孔洞里被拉开并从 stick 形变为 cartoon；同时按用户反馈把光标行为从"精准机器"改回"人手"。副线是应用内的一批收口打磨——Chat 与 Plan 侧栏高度对齐、登录态三态化、TopNav 移动端菜单、聊天空态星系背景等。
+
+### 工作内容
+
+**一、Landing 开场动画全新实现（`Interface/src/components/landing/SwarmIntro.jsx`，新增 1139 行）**
+
+- **六智能体分工**：mira（标题打字）、fold（蛋白窗口操作）、dock（页头打字）、helix（段落打字）、nova（CTA 标签打字）、sage（重音词框选改色）。每个 agent 拥有独立光标与名牌，共享同一套时间轴。
+- **真实窗口而非假绘制**：遮罩层用 SVG `mask` 在 hero 区域挖孔，露出的就是线上那个 `Hero3DViewer` 实例；fold 在孔洞上按下拖拽手柄把窗口"拉开"，随后沿右边缘自下而上描边，驱动 stick → cartoon 形变。全程没有第二块 canvas、没有贴图假图。
+- **所有可见文本逐字符打出**：采用"克隆线上真实 DOM 节点 + 清空文本"的方式，字号/字重/字距/断行/颜色与线上**同源**（同一次 layout 计算），因此结构上不可能出现"动画版和线上版不一致"。
+- **首尾帧像素一致**：开场期间页面被冻结在最终几何（`.is-intro-active`），收尾时整层无过渡直接卸载，不存在交叉淡入/模糊/缩放。
+- **sage 的框选**：accent 词 `protein designer` 先以墨色打出，sage 拖出选框（1.5px 绿边 + 7% 绿填充 + 4px 圆角，从左上角按 `scale(p,p)` 长到右下角），框选完成后 accent 翻绿（`#17a96e`，460ms），随后选框淡出。
+- **时序常量表**（`SwarmIntro.jsx` 顶部集中定义，便于调参）：`ENTER_BASE 180` / `ENTER_STEP 24` / `ENTER_DUR 420` / `DISPATCH_T 1380` / `DISPATCH_STEP 50` / `HEADER_T 1980` / `HEADLINE_T 2320` / `COPY_T 3200` / `CTA_T 4150` / `MORPH_T 4980` / `HOLE_T 1600` / `HOLE_DUR 720` / `SELECT_DRAG 480` / `SELECT_HOLD 220` / `APPROACH_MS 260`。
+
+**二、Hero3DViewer 支持开场阶段（`Interface/src/components/landing/Hero3DViewer.jsx` +100 行）**
+
+- 新增 `introStage` 属性：`'stick' | 'morph' | 'final' | null`；`HERO_INTRO_MORPH_MS = 1500`（写入 `heroMotionConfig.js`）。
+- `paintIntroStage()` 在同一 canvas、同一相机、同一自转下完成 stick → cartoon 过渡，形变末帧即正常落地页渲染结果。
+- 模型就绪后广播 `window.__proteinHeroReady = true` 并派发 `protein-hero-ready` 事件，供开场动画对齐开洞时机。
+
+**三、LandingPage 接入（`Interface/src/pages/LandingPage.jsx` +93 行）**
+
+- 为 nav / brand / navlinks / headline / accent / copy / cta / hero-inner 补齐 `data-swarm` 锚点，供克隆与定位使用。
+- 开场期间 accent 词轮播暂停（避免正在被"打字"的词中途被换掉），揭幕后再恢复 5s 轮转。
+- 新增"重播开场"按钮（`landing_intro_replay`，中英文案已补）。
+
+**四、样式层（`Interface/src/index.css` +406 行，新增 40 条类规则）**
+
+- 新增 `.swarm-paper` / `.swarm-stage` / `.swarm-clone` / `.swarm-caret` / `.swarm-selection` / `.swarm-cta-sheen` / `.swarm-cursor` / `.swarm-intro-skip` / `.swarm-hero-handle` 等开场所需样式；`prefers-reduced-motion` 下关闭旋转动画。
+- `.landing-page.is-intro-active` 冻结滚动/动效，粒子画布淡出。
+
+**五、Chat 与 Plan 侧栏高度对齐（`AgentChat.jsx` / `BioAgentChat.jsx` / `HtsAgentChat.jsx`）**
+
+- 之前为适配矮视口统一改成 `clamp(560px, 70vh, 680px)`，导致**聊天窗口被缩短、与原定长度的 Plan 侧栏对不齐**。现恢复固定高度：内联 shell 统一 `height: 660`（全屏仍为 `100%`），Plan 卡片复用同一 `shellHeight` 并保留 16px 间距，两卡首尾同行。
+- 实测（1600×1000）：Chat `x=267 y=108 w=732 h=660`，Plan `x=1015 y=108 w=304 h=660`，底边同为 768。
+
+**六、登录态三态化与错误语义修正（`AuthGate.jsx` +157 / `AuthCard.jsx` +26 / `UserAccount.jsx` +80 / `lib/api.js` +10）**
+
+- `AuthGate` 由二态改为三态：`checking` → `ready` → `error`（后端 5xx 或离线时给出平静的重试页）。**服务故障不再清 token、也不再表现成"被登出"**；只有 401/403 才判定凭证失效并跳回落地页。
+- `api.js` 的 403 分流：只有 `detail` 命中凭据类关键字（not authenticated / invalid token / expired / credentials…）才跳登录，管理端"无权限"的 403 不会把用户踢出登录态。
+- `AuthCard` / `UserAccount` 统一走 `readApiError`：**不再把 502/504 的 nginx HTML 页面当 JSON 解析**（原来会抛 `Unexpected token <` 这类无意义报错）；区分"服务暂时不可用""无法连接服务器""登录失败"三类文案。
+
+**七、其余 UI 收口**
+
+- `TopNav.jsx` +67：新增移动端汉堡菜单（`pointerdown` 外部点击关闭 + `Escape` 关闭 + `aria-expanded`）。
+- 新增 `AgentOrbitBackdrop.jsx`（34 行）：聊天空态的星系背景——三条缓慢自转的椭圆轨道 + 径向辉光（56s 一圈），**替代此前固定的"行星点"**，动起来不再呆板。
+- `AgentChat` / `BioAgentChat` / `HtsAgentChat`：空态新增 launcher 形态（大标题 + 描述 + 独立占位符），与"续问"形态区分；相关中英文案已在 `LanguageContext.jsx` 补齐。
+
+### 结果与产出
+
+- **提交**：`34e49f1`（ProteinCraft-Agents，2026-11-24），**24 文件 +2346 / −255**；其中前端源码与部署产物 **20 文件 +2325 / −255**。
+- **核心新增**：`SwarmIntro.jsx` 1139 行、`AgentOrbitBackdrop.jsx` 34 行；`index.css` +406 行 / 40 条新类。
+- **部署**：`npm run build` 后同步 `Backend/static/assets`（`index-DMbHJFQ9.js` / `index-BnDGDUUW.css`）与 `Backend/static/index.html`，线上静态资源与源码一致。
+- **质量验证**：Playwright + headless Chromium 在 **1600×1000** 与 **1024×640** 双分辨率下逐帧采样光标轨迹——无 pageerror、无 console error；任意时刻**均未出现 ≥3 个光标挤在同一竖列**（此前"左边四个起始点太整齐"的问题消失）；开场结束后遮罩正常卸载，标题全文完整、accent 实测 `rgb(23, 169, 110)`。
+
+### 遇到的问题及解决
+
+- **"光标是不是被提速了？"——结论是并没有提速，是错觉**：核对代码发现三档平滑时间常数（`slow 62 / follow 30 / fallback 100`）并未整体上调，真正的观感来源是"六个光标同时从 wordmark 齐飞 + 行程变长"。按用户要求把速率**回到原值**：平滑判据改回 `follow && !slow ? 30 : 100`，并把慢速档从 62 拉回 100；同时用 `DISPATCH_STEP = 50` 的错峰出发替代齐飞。
+- **"一开始就精准悬停在工作轨迹起点"太机械**：改为每个 agent 先停在工作区旁 **12–34px 的不同方向**（`HOVER_OFFSET`），路径带**逐渐衰减的弧线摆动**（720ms 内 ±10px/±7px），只有在自己工作开始前 **260ms**（`APPROACH_MS`）才轻轻归位到真正的插入点。
+- **窄屏悬停点出界**：1024 宽下 helix / sage 的偏移 x 被推到负数，加视口约束 `clamp(x, 12, vw-32)` / `clamp(y, 12, vh-32)` 修正。
+- **sage 光标与选框脱节约 58px**：低帧率下平滑滞后导致指针追不上自己的框。给拖拽段加 `exact: true`（拖拽期间不做平滑、不加抖动），实测选框右下角 (526.1, 421.6) 与指针坐标完全一致。
+- **accent 颜色在挂载瞬间由绿渐变成墨**：原因是 `transition` 与 `color` 同时赋值。改为挂载时 `transition: 'none'` + 置墨色，翻转时刻再开启 `transition: color 460ms`。
+- **预览环境访问 `/app` 被弹回落地页**：vite preview 把 `/api` 代理到真实后端，伪 JWT 返回 401 导致 `AuthGate` 清 token 并 `location.replace('/')`。QA 脚本改用 `page.route` mock 掉全部 `/api/**`（`auth/me`、`agent/sessions`、`agent/manifest` 及兜底 200）。
+- **后端静态资源与前端构建漂移**：新增构建后必须同步 `Backend/static/assets` 与 `index.html` 的步骤，本轮已随提交一起落库。
+
+### 下一步计划
+
+- **构建与部署流程固化**：把"前端构建 → 同步 `Backend/static`"写进 Makefile 或 CI 脚本，避免人工同步漏步造成线上旧资源
+- **开场动画性能复核**：当前在 SwiftShader 软件渲染下整段约 7.8–9.2s，需在真实 GPU 环境复测帧率与总时长，必要时按机器分档下调 `ENTER_DUR` / `HOLE_DUR`
+- **可访问性收尾**：开场遮罩需补一条 `aria-live` 的旁白或直接提供"跳过开场"（结构已预留 `.swarm-intro-skip`），确保键盘与读屏用户不被动画阻塞
+- **沿用上期未完项**：`.trae/skills/` 与 `.cursor/rules/` 的版本管理待决策；后端 `Backend/main.py` 残留的模型兜底（`or "proteina"`）改用 `_catalog_default_model_id()`；dG 口径闭环；3 项既有失败测试的断言语义化
+- **回归 3 项既有失败测试**：`test_agent_action_parser.py` 仍有 3 项改动前既有失败（前端字面量断言、靶点区间夹具、PyYAML 键引号风格），需改为语义化断言
