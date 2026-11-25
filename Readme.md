@@ -1701,3 +1701,96 @@ cannot open '.../.git/worktrees/nanobody/FETCH_HEAD': Permission denied
 - **可访问性收尾**：开场遮罩需补一条 `aria-live` 的旁白或直接提供"跳过开场"（结构已预留 `.swarm-intro-skip`），确保键盘与读屏用户不被动画阻塞
 - **沿用上期未完项**：`.trae/skills/` 与 `.cursor/rules/` 的版本管理待决策；后端 `Backend/main.py` 残留的模型兜底（`or "proteina"`）改用 `_catalog_default_model_id()`；dG 口径闭环；3 项既有失败测试的断言语义化
 - **回归 3 项既有失败测试**：`test_agent_action_parser.py` 仍有 3 项改动前既有失败（前端字面量断言、靶点区间夹具、PyYAML 键引号风格），需改为语义化断言
+
+## 汇报日期 2026-11-24 ~ 2026-11-25：Agent 推理链路产品化（Thinking 可回看 + 计时口径统一 + 中止终态收敛）+ 对话自动续跑与 Plan 常驻 + 分析沙箱内核级加固 + GPU 显存按模型预检
+
+> 本轮主线是把**模型的推理过程**从"一个转圈的图标"升级为**可回看、可测量、状态自洽**的一等公民：后端开始流式下发并持久化 thinking 文本，前端把它渲染成一条可展开的推理轨迹行；同时把三类工程隐患一并根治——计时口径在组件重挂载时重置、中止后工具卡残留 running 动效、上下文压缩把 Plan 一起压掉。副线是**分析沙箱从 Python 审计钩升级到内核级隔离（Landlock + seccomp）**、**Agent 意外中断自动续跑**、**GPU 调度按模型显存需求预检**。
+
+### 工作内容
+
+**一、Agent 推理链路产品化：thinking 从"不可见"到"可回看"（后端 `Backend/main.py` + `ProteinHarness/llm_client.py` + 前端 `transcript.js` / `designAgentStream.js` / `ThinkingUI.jsx` / `AgentChat.jsx`）**
+
+- **后端新增两个 op**：`_OpType.THINKING_DELTA`（瞬时增量，不落盘）与 `_OpType.THINKING`（持久化整段推理 + `seconds`），配套 `_TranscriptOp.thinking_delta()` / `.thinking()` 工厂方法。
+- **流式下发**：`llm_client.py` 在 Anthropic thinking delta 处额外 `yield {"type": "thinking", "content": thinking_text}`；`agent_loop.py` 把 `thinking` 事件纳入透传分支（原先只透传 `thinking_start` / `thinking_end`）。
+- **持久化**：`_TranscriptAccumulator` 新增 `_thinking_text` 累加器，`thinking_end` 时若本轮有推理文本且会话类型为 `design`，产出一条 `role: "thinking"` 的 transcript 行（含 `seconds` / `turn_id` / `seq`），并让 `_persist_op` 对 `THINKING` 走写入分支（`THINKING_DELTA` 明确列为瞬时、不落盘）。
+- **前端单行模型**：`transcript.js` 新增四个 case —— `THINKING_START` 建**空内容行**（点阵 + 秒数、暂不出现箭头）、`THINKING_DELTA` 往**同一行**累加文本（不再新建行）、`THINKING` 收尾并计算 `seconds`、`THINKING_END` 关闭 `_streaming`。
+- **UI**：`ThinkingUI.jsx` 的 `ThoughtPanel` 重写为统一形态 —— 28px 行高、无边框无按钮底色、点阵动效（复用 `DotmSquare15`）、右侧 chevron 箭头、展开时自动跟随流式尾部；流式态显示"思考 3.2s"，结束后切换为"思考了 N 秒"，并去掉原先的描边卡片样式。`AgentChat.jsx` 用 `ChatRailRow` + `Brain` 图标 + 紫色 accent 渲染推理行；assistant 气泡前若已存在同轮 thinking 行，则不再重复渲染 `ThoughtFor` 指示器。
+
+**二、Thinking 计时口径统一（根因：同一阶段被两个组件实例渲染）**
+
+- **根因定位**：列表末尾的独立等待面板 `ThoughtPanel` 以组件自身 `mountRef` 起算；首段 delta 到达时该面板被卸载、transcript 新建 thinking 行 → 组件**重挂载** → 读数从新实例重新开始、箭头也在此刻才出现。因此用户看到的是"先出现无箭头的 thinking（读秒中）→ 箭头出现后重新计时"。
+- **修复**：① 阶段起点由**流程状态**持有（`designStreamChannel.thinkingStartedAt`，跨组件、跨会话广播），禁止再用组件 `mountRef` 作为计时起点；② 一个推理阶段只对应**一条** thinking 消息行，`thinking_start` 即建行、delta 只填内容，组件不重挂载；③ `designAgentStream.js` 的 `enrichOp` 为 thinking 系列 op 注入 `_startedAt`，`applyThinkingSideEffects` 在 `thinking_start` **同帧**撤掉底部等待面板，避免两个指示器并存。
+- **后端 seconds 退居兜底**：最终 `Thought for N s` 优先用同一行的 `_startedAt` 本地计算（`max(1, round((Date.now()-start)/1000))`），仅在没有本地起点（历史回放）时才用后端测量值，保证"流式读数"与"最终读数"是同一个钟。
+
+**三、终态收敛：中止后不再残留 running 动效（`designAgentStream.js` + `AgentChat.jsx` + `index.css` + i18n）**
+
+- **根因**：工具卡的 `running` 结束只依赖 `op_toolcard_close` 事件，而 abort / 断连后该事件永不到达 → 卡片永远停在绿色呼吸动效上，UI 宣称"正在执行"但实际请求已随中断结束。这是**状态机缺终态**，不是样式问题。
+- **修复**：新增 `finalizeInterrupted()` —— 把所有 `status === 'running'` 的工具卡置为 `cancelled`、把 `_streaming` 的推理行收尾；由两条流（`agent_interpret` / `agent_chat`）的 `finally` 中 `runStreamTeardown(...)` 统一调用，**不依赖任何特定事件到达**。状态取值收敛为 `running | done | error | cancelled` 四值，新增 i18n `tool_stopped`（en `stopped` / zh `已停止`）；`.is-running` 类名随状态移除，呼吸动效随即停止。
+- **规则沉淀**（前端工程实践类，非设计类）：新建 `.cursor/rules/frontend-stream-state-lifecycle.mdc`（`alwaysApply: false` + `globs: Interface/src/**`），6 条规则 —— 进行中状态必须有三出口；终态收敛只允许一个入口且放在 `finally`；中断即终态（同时停动效/计时器/轮询/订阅）；渲染层禁止把缺失状态 fallback 成 `running`；**计数/计时不得随组件重挂载重置**；并给出可验收标准与参考实现指向 `finalizeInterrupted()`。
+
+**四、CJK 加粗不渲染修复（`Interface/src/lib/chatMessages.js` + 测试）**
+
+- CommonMark 在"`**…标点**`紧跟中文字符"这种写法下无法闭合强调定界符（`**隔离。**以下是`），模型输出的加粗泄漏成字面星号。修法是在归一化阶段把结尾标点移出强调范围：`**$1**$2`，渲染效果完全等价；补 2 条单测（修复用例 + 普通加粗不受影响）。
+
+**五、Agent 意外中断自动续跑（`ProteinHarness/text_sanitize.py` + `agent_loop.py` + `CORE.md` + `agent_config.json`）**
+
+- 引入显式结束标记 `[[END_CHAT]]`：后端在持久化/下发前剥离（含尾部半截标记的实时保留），并在 `has_end_chat_marker()` 判定回合是否正常结束。
+- **自动续跑守卫**：一轮结束时若既没有工具调用、也没有 `[[END_CHAT]]`，视为意外停止；后端补发一条 `<PLATFORM_NUDGE reason=no_end_chat>` 继续本轮，最多 3 次（`orchestration.auto_continue` / `auto_continue_max`，仅 design agent 启用，其余 agent 不 teaching 该协议不浪费轮次）。
+- **提示词对齐**：`CORE.md` 增加 "Turn-ending protocol (required)"，明确只有两种合法结束方式（任务完成 / 等用户），两种都要以 `[[END_CHAT]]` 单独一行结尾。
+- **顺带加固**：`defang_platform_tags()` 对**工具结果**（PDB remarks、文献摘要、记忆等不可信内容）中出现的 `<PLATFORM_STATUS/EVENT/NUDGE>` 字面量插入零宽字符打断标签，防止模型把伪造内容误当平台指令。
+
+**六、上下文压缩不再压掉 Plan（`ProteinHarness/context_compaction.py` + 测试）**
+
+- 新增 `_is_compaction_anchor()`：`<PLATFORM_NUDGE` 开头的 user 消息**不得**成为压缩切分锚点（否则承载 Plan 的真实用户轮次会被摘要掉，Agent 直到下一轮才拿回 Plan）。
+- `write_todos` 的 `input` 从工具输入裁剪名单中移除（Plan 本身必须逐字保留）；摘要提示词新增硬性要求"逐字保留当前 TODO 列表（ids / content / status）"。
+- 补 3 条单测（nudge 不当锚点、单轮不丢 plan、`write_todos` 不裁剪）。
+
+**七、首条回复生成中，会话也能出现在 History（`Backend/main.py`）**
+
+- 真实用户轮次一开始即置 `session.metadata["in_progress"] = True`（并记 `in_progress_since`），流结束（含异常）在 `finally` 中清除并**落盘**（避免重启后被钉死）。`list_agent_sessions` 允许"进行中且已有真实用户轮次"的会话进入列表，用户在首条回复尚未产出时新开对话，History 里也能看到该会话。
+
+**八、分析沙箱内核级加固（新增 `Backend/sandbox/landlock_confine.py` 210 行 + `seccomp_confine.py` 79 行，改 `mcp_server.py` / `runner.py`）**
+
+- **Landlock（文件系统 + TCP）**：以 ABI 1–6 能力集在 MCP server 启动前自我限制（免 root），约束读/写/执行/列目录/删除/截断与 TCP connect/bind，并关闭 abstract unix socket 通信；无 Landlock 的内核上优雅降级。
+- **seccomp（网络）**：在系统调用层拒绝创建 `AF_INET` / `AF_INET6` / `AF_PACKET` 套接字，堵住原生扩展绕过 Python 审计钩的通道；过滤器被子进程继承。
+- **审计钩白名单收紧**：写入仅限 `USER_ROOT` + 私有 `TMPDIR`；`results/` 根目录列举改为**只列自己 allow-list 的 run**（空 allowlist 不暴露任何 run）；`os.listdir` / `os.scandir` 纳入路径判定（原先只管 `open`）。
+- **环境隔离**：沙箱子进程不再继承后端环境变量（其中含 API key 等租户密钥），`TMPDIR` 指向用户私有目录，避免共享 `/tmp` 互相投毒。
+- **回归测试**：新增 `KernelBoundaryTests` 4 条 —— 读主机密文、列沙箱父目录 / results 根、写删平台文件、开网络，全部断言 `PermissionError`。
+
+**九、GPU 调度按模型显存需求预检（`Backend/main.py` + `model_runs.py`）**
+
+- 调度前先解析**队首任务**的模型卡 `vram_gb`，叠加 2 GiB headroom（CUDA context / 激活值 / 碎片通常额外吃 1–2 GiB），作为该卡的空闲显存门槛；不满足时任务**留在队首**（不再被弹出后丢失），等运行中的任务释放后重试。无模型卡的发型骨架按 24 GiB 保守峰值处理。
+- 独立方法运行（folding/scoring）同样按模型卡需求申请 GPU（`_acquire_model_run_gpu(model_id)`），避免把 24–32 GiB 的生成模型塞进只空 8 GiB 的卡里导致 CUDA OOM；卡容量本身小于需求时只允许"近乎独占"使用。
+
+**十、其余前端收口**
+
+- 移除工具卡的**旋转半边框动效**（`.tool-orbit.is-running::after`），改为状态文字 + 呼吸点表达"进行中"。
+- **会话切换不打断后台生成**：切走再切回同一会话时，识别 channel 上仍在进行的流，**接管**其消息、Plan、thinking 标志与计时起点，而不是用服务端旧快照覆盖；切到其他会话则保留后台流的忙状态而不误清。
+
+### 结果与产出
+
+- **代码规模**：`git diff --stat` 25 个已跟踪文件 **+1045 / −2555**，另新增 3 个文件（`landlock_confine.py` 210 行、`seccomp_confine.py` 79 行、`.cursor/rules/frontend-stream-state-lifecycle.mdc`）。
+- **改动分布**：后端 `Backend/main.py`（+193）、`Backend/sandbox/mcp_server.py`（+175）；Agent 侧 `ProteinHarness/agent_loop.py`（+62）、`text_sanitize.py`（+51）、`context_compaction.py`（+35）、`CORE.md`（+11）、`llm_client.py`（+1）；前端 `Interface/src/components/AgentChat.jsx`（+218）、`ThinkingUI.jsx`（+155）、`lib/transcript.js`（+104）、`lib/designAgentStream.js`（+49）、`lib/chatMessages.js`（+7）、`index.css`（−10）、`i18n/LanguageContext.jsx`（+8）。
+- **前端构建同步**：`npm run build` 后 rsync 至 `Backend/static`，当前产物 `assets/index-BSaD4dHq.js`（1.94 MB）+ `assets/index-B4mpUxc7.css`（93 KB），`Backend/static/index.html` 引用的 hash 与产物一致。
+- **测试验证**：前端 `npm run test:unit` → **56 / 56 全通过**；后端 `pytest Backend/test_sandbox.py ProteinHarness/test_context_compaction.py` → **43 passed**。
+- **行为验证**（脚本化）：thinking 生命周期 `start → delta → final` 全程**恒为 1 行**、起点不漂移、终态 `seconds = 8` 与本地起点一致；中止后工具卡一帧内变为"已停止 / stopped"且动效消失。
+
+### 遇到的问题及解决
+
+- **"先出现无箭头 thinking，箭头出现后反而重新计时"**：第一版只统一了时间戳来源，没有消除组件重挂载本身。改为**一个阶段一条消息行**——`thinking_start` 即建空行（此时已有点阵与秒数），delta 只往这行填内容，箭头在有正文后出现；并把起点从组件 `mountRef` 迁到流程状态（`designStreamChannel.thinkingStartedAt`）。同时在 `thinking_start` 同帧撤掉底部等待面板，杜绝两个指示器并存。
+- **"中止后工具卡还在 running 转"**：定位为状态机缺终态（不是 CSS 动画问题）。引入 `finalizeInterrupted()` 作为**唯一**收敛入口，放在两条流的 `finally`；新增 `cancelled` 状态与"已停止"文案，动效由 `is-running` 类名驱动，状态一变即自动停。
+- **压缩对话时 Plan 被一起压掉**：压缩切分锚点被 `<PLATFORM_NUDGE>` 抢占了承载 Plan 的真实用户轮次。新增 `_is_compaction_anchor()` 排除 nudge 类 user 消息，并把 `write_todos` 的 input 从裁剪名单移除、摘要提示词要求逐字保留 TODO。
+- **沙箱审计钩挡不住原生代码**：`os.listdir` / `os.remove` / `ctypes` / 原生扩展都绕过 `open` 事件钩。补 Landlock（内核级文件与 TCP 约束）+ seccomp（禁 AF_INET/AF_INET6/AF_PACKET 套接字创建）双保险，并让审计钩只管 Python 层。
+- **Landlock 白名单踩坑**：初版把 `/proc/self` 放进允许列表，但 Landlock 的路径规则只覆盖**自身 PID**，子进程读不到自己的 `/proc/self/status`；该条已撤回。同时 `LIB_ROOT` 也从沙箱读取白名单移除。
+- **seccomp 比较值踩坑**：`SCMP_CMP_EQ` 的正确枚举值是 **4**（不是 0），否则规则静默失效、socket 仍可创建。
+- **沙箱子进程继承了后端密钥环境**：`runner.py` 原先在降级路径下 `os.environ.copy()`，会把 API key 等租户密钥带进沙箱。改为**只传显式白名单**（`PATH` 等），并把 `TMPDIR` 指向用户私有目录。
+- **GPU 调度把大模型塞进小卡导致 OOM**：原预检是固定 8 GiB 地板。改为按队首任务的模型卡 `vram_gb` + headroom 判定，并把不满足的任务留在队首而非弹出丢弃。
+- **规则共享机制查证**：核实 Cursor（`.cursor/rules/*.mdc`）与 TRAE（`.trae/rules/*.md`）的规则加载为四种模式 —— Always Apply（`alwaysApply: true`）、Apply to Specific Files（`alwaysApply: false` + `globs`）、Apply Intelligently（`alwaysApply: false` + `description`）、Apply Manually（`@rule-name`）；**不存在**被自动读取的 `.agents/` 目录约定，跨工具通用的是根目录 `AGENTS.md`。
+
+### 下一步计划
+
+- **代码提交与部署**：本轮改动目前仍在 `ProteinCraft-Agents` 工作区**未提交**（`34e49f1` 之后），需确认后统一提交并同步 `Backend/static` 产物
+- **规则跨 Agent 共享**：新写的 `.cursor/rules/frontend-stream-state-lifecycle.mdc` 目前**仅**存在于 `.cursor/rules/`（且 `.cursor/`、`.trae/` 均被 `.gitignore` 忽略，未入库）。待决策：① 根 `AGENTS.md`（始终生效、跨工具通用）；② `.cursor/rules` + `.trae/rules` 两份各存一份（各自原生、可带 globs）；③ 单一正文 + 薄指针文件
+- **前端端到端验收**：强刷浏览器确认三项可见效果 —— ①thinking 读秒不因箭头出现而重置；②点停止后工具卡立即变"已停止"且呼吸动效消失；③刷新 / 切走切回会话状态一致无残留进行中指示
+- **回归 3 项既有失败测试**：`test_agent_action_parser.py` 仍有 3 项改动前既有失败（前端字面量断言、靶点区间夹具、PyYAML 键引号风格），需改为语义化断言
+- **沿用上期未完项**：构建与部署流程固化（前端构建 → 同步 `Backend/static` 写进 Makefile/CI）；`Backend/main.py` 残留的模型兜底 `or "proteina"` 改用 `_catalog_default_model_id()`；dG 口径闭环；Landing 开场动画在真实 GPU 下复测帧率与可访问性收尾
